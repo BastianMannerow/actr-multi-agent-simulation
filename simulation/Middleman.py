@@ -14,7 +14,7 @@ class Middleman:
     Design
     ------
     - Created before the Environment instance; attached later via `set_game_environment()`.
-    - Stateless regarding simulation progression; operates purely as a message-passing layer.
+    - Stateless with respect to simulation progression; acts as a message-passing layer.
     - Used by `Simulation` to unify ACT-R interaction with a matrix world.
 
     Attributes
@@ -27,7 +27,7 @@ class Middleman:
         Enables optional debug logging for inspection of agent-environment exchanges.
     """
 
-    def __init__(self, simulation, print_middleman):
+    def __init__(self, simulation, print_middleman: bool):
         self.simulation = simulation
         self.experiment_environment = None
         self.print_middleman = print_middleman
@@ -39,11 +39,6 @@ class Middleman:
         """
         Attach the environment instance after its creation.
 
-        Reasoning
-        ---------
-        The Middleman is initialized before the environment exists,
-        so this delayed wiring ensures proper dependency order.
-
         Parameters
         ----------
         experiment_environment : Environment
@@ -54,14 +49,9 @@ class Middleman:
     # ---------------------------------------------------------------------
     # Agent → Environment: Motor interface
     # ---------------------------------------------------------------------
-    def motor_input(self, key, current_agent):
+    def motor_input(self, key: str, current_agent: AgentConstruct):
         """
         Execute environment actions based on a symbolic key command.
-
-        Purpose
-        --------
-        Simulates motor output by translating discrete key events into
-        environment movements (e.g., "W" → move up).
 
         Parameters
         ----------
@@ -82,15 +72,15 @@ class Middleman:
     # ---------------------------------------------------------------------
     # Environment → Agent: Perception interface
     # ---------------------------------------------------------------------
-    def get_agent_stimulus(self, agent):
+    def get_agent_stimulus(self, agent: AgentConstruct):
         """
         Generate a visual stimulus representation for a specific agent.
 
         Purpose
-        --------
-        - Samples the environment grid around the agent based on its line of sight (LoS).
-        - Produces symbolic stimuli (letters) representing nearby agents or objects.
-        - Updates the agent’s internal `visual_stimuli` buffer for cognitive access.
+        -------
+        - Sample the environment grid around the agent based on its line of sight (LoS).
+        - Produce symbolic stimuli (letters) representing nearby agents or objects.
+        - Update the agent’s internal `visual_stimuli` buffer for cognitive access.
 
         Parameters
         ----------
@@ -99,10 +89,11 @@ class Middleman:
 
         Returns
         -------
-        tuple[list[str], list[dict]]
-            *new_triggers* — all visible object symbols
+        tuple[list[str], list[dict]] or (None, None)
+            *new_triggers* — all visible object symbols,
             *stimuli* — a single-element list containing a dict mapping indices to
             `{"text": symbol, "position": (row, col)}`.
+            Returns ``(None, None)`` if the agent is not found.
         """
         matrix = self.experiment_environment.level_matrix
         r, c = self.experiment_environment.find_agent(agent)
@@ -114,17 +105,20 @@ class Middleman:
         rows, cols = len(matrix), len(matrix[0])
 
         # Determine the visible area based on line of sight (LoS)
-        if los == 0 or los > cols or los > rows:
+        if los == 0 or los >= max(rows, cols):
+            # Full visibility over the entire matrix
             x_los = cols
             y_los = rows
-            off_x = off_y = 0
+            off_x = c
+            off_y = r
         else:
+            # Square window around the agent: Chebyshev radius = los
             x_los = y_los = 2 * los + 1
             off_x = off_y = los
 
         new_triggers = []
         frame = {}
-        visual_stimuli = [['' for _ in range(x_los)] for _ in range(y_los)]
+        visual_stimuli = [["" for _ in range(x_los)] for _ in range(y_los)]
         index = 0
 
         # Scan through the visible window
@@ -135,11 +129,15 @@ class Middleman:
 
                 # Out of bounds
                 if mi < 0 or mi >= rows or mj < 0 or mj >= cols:
-                    visual_stimuli[i][j] = '-'
+                    visual_stimuli[i][j] = "-"
                     continue
 
-                # Inspect all elements in the cell
-                for element in matrix[mi][mj]:
+                cell = matrix[mi][mj]
+                if not cell:
+                    visual_stimuli[i][j] = "-"
+                    continue
+
+                for element in cell:
                     if isinstance(element, AgentConstruct):
                         # Identify other agents using symbolic letter codes
                         for sym, info in agent_map.items():
@@ -150,6 +148,8 @@ class Middleman:
                                 index += 1
                                 break
 
+                    # Extend here for additional object classes if needed,
+                    # e.g. Food, Wall, RewardZone, etc.
                     # Example: Extend here for additional object classes
                     # e.g., Food, Wall, RewardZone, etc.
                     # elif isinstance(element, Food):
