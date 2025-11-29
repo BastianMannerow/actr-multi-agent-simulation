@@ -19,10 +19,10 @@ attach powerful external modules—such as **large language models** or
 robot controllers—as explainable extensions to the core cognitive
 system.
 
-![Concept overview](Concept.png)
-
 **A detailed, step-by-step tutorial for setting up and extending
 the framework is available in the project Wiki.**
+
+![Concept overview](Concept.png)
 
 ## Key Features
 
