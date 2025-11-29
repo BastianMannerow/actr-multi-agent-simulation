@@ -22,29 +22,6 @@ system.
 **A detailed, step-by-step tutorial for setting up and extending
 the framework is available in the project Wiki.**
 
-## Abstract
-
-Classical ACT-R models are typically implemented and evaluated in
-single-agent settings. While multi-agent scenarios can in principle be
-constructed in Lisp ACT-R or pyactr, the lack of orchestration for
-multiple agents, shared environments, and debugging tools makes such
-simulations cumbersome and error-prone.
-
-This framework introduces:
-
-- a time-aware scheduler for multiple ACT-R agents,
-- a shared grid-world environment with line-of-sight (LoS) based
-  visual stimulation,
-- a "Middleman" component that mediates motor and perceptual traffic
-  between agents and the environment,
-- a Tkinter-based stepper GUI for single-step execution, logging, and
-  "jump to production" debugging, and
-- an extension layer for pyactr that provides ergonomic access to goals, imaginal buffers, declarative memory, utilities, and other internal structures during simulation.
-
-The goal is to make multi-agent ACT-R simulations in Python practical
-and transparent enough for serious cognitive modeling, including
-models of social interaction and normative behavior.
-
 ## Key Features
 
 ### Multi-Agent Scheduling and Time Control
