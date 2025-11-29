@@ -65,7 +65,7 @@ class Simulation:
                 simulation=self
             )
 
-        # Jump control (stepper-only)
+        # Jump to control (stepper-only)
         self.jumping = False
         self.jump_target = None
 

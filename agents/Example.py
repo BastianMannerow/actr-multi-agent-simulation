@@ -94,6 +94,9 @@ class Example:
         for phase in self.goal_phases:
             actr.chunktype(phase, "state")
 
+        # Adding imaginal (you can add multiple and change the name to your liking)
+        actr_agent.set_goal(name="imaginal", delay=0)
+
         # Add productions corresponding to the first goal phase
         self.add_productions(actr_agent, self.goal_phases[0])
         return actr_agent
