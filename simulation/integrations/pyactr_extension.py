@@ -307,6 +307,10 @@ def set_goal(agent_construct: Any, chunk: chunks.Chunk) -> None:
         :class:`pyactr.chunks.Chunk` instance to be added to the goal buffer.
     """
     first_goal = next(iter(agent_construct.actr_agent.goals.values()))
+    try:
+        first_goal.clear()
+    except AttributeError:
+        pass
     first_goal.add(chunk)
 
 
@@ -334,6 +338,44 @@ def get_imaginal(agent_construct: Any, key: str):
     return goals[key]
 
 
+def get_buffer(agent_construct: Any, name: str):
+    """Return any named ACT-R buffer if it exists on the model or running simulation."""
+    simulation = getattr(agent_construct, "simulation", None)
+    simulation_buffers = getattr(simulation, "_Simulation__buffers", None)
+    if isinstance(simulation_buffers, dict) and name in simulation_buffers:
+        return simulation_buffers[name]
+
+    model = getattr(agent_construct, "actr_agent", None)
+    for attribute in ("_ACTRModel__buffers", "goals", "retrievals", "visbuffers"):
+        mapping = getattr(model, attribute, None)
+        if isinstance(mapping, dict) and name in mapping:
+            return mapping[name]
+    return None
+
+
+def replace_buffer(agent_construct: Any, name: str, chunk: chunks.Chunk) -> None:
+    """Replace the content of a named buffer with exactly one chunk."""
+    buffer = get_buffer(agent_construct, name)
+    if buffer is None:
+        raise KeyError(f"Buffer '{name}' does not exist.")
+    try:
+        buffer.clear()
+    except AttributeError:
+        pass
+    if chunk is not None:
+        buffer.add(chunk)
+
+
+def set_buffer(agent_construct: Any, name: str, chunk: chunks.Chunk) -> None:
+    """Compatibility alias for :func:`replace_buffer`."""
+    replace_buffer(agent_construct, name, chunk)
+
+
+def chunk_from_string(string: str) -> chunks.Chunk:
+    """Parse a textual ACT-R chunk definition into a chunk object."""
+    return pyactr.chunkstring(string=string)
+
+
 def set_imaginal(agent_construct: Any, new_chunk: chunks.Chunk, key: str) -> None:
     """
     Write a chunk into a named buffer (for example the imaginal buffer).
@@ -358,6 +400,10 @@ def set_imaginal(agent_construct: Any, new_chunk: chunks.Chunk, key: str) -> Non
         return
 
     target = goals[key]
+    try:
+        target.clear()
+    except AttributeError:
+        pass
     try:
         target.add(new_chunk)
     except AttributeError as exc:

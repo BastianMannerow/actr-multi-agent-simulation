@@ -1,4 +1,4 @@
-from simulation import pyactrFunctionalityExtension
+from simulation.integrations import pyactr_extension
 import pyactr as actr
 
 class ExampleAdapter:

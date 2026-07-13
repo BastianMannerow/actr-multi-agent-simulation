@@ -1,4 +1,6 @@
-class AgentConstruct:
+from simulation.world.entities import SpatialAgent
+
+class AgentConstruct(SpatialAgent):
     """
     Container class connecting an ACT-R agent, its environment bindings,
     adapters, and runtime metadata.
@@ -37,6 +39,8 @@ class AgentConstruct:
         los : int
             Line-of-sight distance for perceptual range.
         """
+        super().__init__(name)
+
         # --- ACT-R binding and synchronization ---
         self.realtime = False                # Whether to run in ACT-R real-time mode (computationally heavy).
         self.actr_agent = None               # Core pyACT-R agent instance (Lisp model equivalent).
@@ -47,7 +51,6 @@ class AgentConstruct:
         self.actr_construct = None           # Placeholder for future replacement; deprecated internal reference.
 
         # --- Metadata and runtime identifiers ---
-        self.name = name
         self.name_number = name_number       # Public GUI identifier, used to bind visuals to agents.
         self.actr_time = 0.0                 # Local cognitive time, synced with simulation clock.
         self.middleman = middleman
@@ -81,13 +84,21 @@ class AgentConstruct:
         self.actr_construct = actr_construct
 
     def set_simulation(self):
-        """
-        Initialize the ACT-R internal simulation.
+        """Initialize the ACT-R simulation and load the model's initial goal."""
+        if self.actr_agent is None:
+            self.simulation = None
+            return
 
-        Used primarily for models utilizing the VISUAL module. This creates
-        the simulation loop with basic timing parameters but no GUI or tracing.
-        """
-        self.simulation = None if self.actr_agent is None else self.actr_agent.simulation(
+        initial_goal = getattr(self.actr_construct, "initial_goal", None)
+        if initial_goal is not None:
+            try:
+                first_goal = next(iter(self.actr_agent.goals.values()))
+                if not list(first_goal):
+                    first_goal.add(initial_goal)
+            except (AttributeError, StopIteration, TypeError):
+                pass
+
+        self.simulation = self.actr_agent.simulation(
             realtime=self.realtime,
             environment_process=self.actr_environment.environment_process,
             stimuli=self.stimuli,
@@ -152,6 +163,8 @@ class AgentConstruct:
         The adapter injects custom arithmetic, boolean, and logical operations
         into the agent’s production rules at runtime.
         """
+        if self.actr_adapter is None:
+            return
         self.actr_adapter.agent_construct = self
         self.actr_adapter.extending_actr()
 

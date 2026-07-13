@@ -1,7 +1,12 @@
-from simulation.Simulation import Simulation
-from simulation.Tracer import Tracer
+from simulation.runtime.simulation import Simulation
+from simulation.runtime.tracer import Tracer
 
-if __name__ == '__main__':
+
+def main() -> int:
     interceptor = Tracer()
     simulation = Simulation(interceptor)
-    simulation.run_simulation()
+    return simulation.run_simulation()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

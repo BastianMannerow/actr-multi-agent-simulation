@@ -1,4 +1,5 @@
-from simulation.AgentConstruct import AgentConstruct
+from simulation.runtime.agent_construct import AgentConstruct
+from simulation.world.entities import SpatialAgent
 
 
 class Middleman:
@@ -96,9 +97,10 @@ class Middleman:
             Returns ``(None, None)`` if the agent is not found.
         """
         matrix = self.experiment_environment.level_matrix
-        r, c = self.experiment_environment.find_agent(agent)
-        if r is None:
+        position = self.experiment_environment.find_agent(agent)
+        if position is None:
             return None, None
+        r, c = position
 
         agent_map = agent.get_agent_dictionary()
         los = agent.los
@@ -138,7 +140,7 @@ class Middleman:
                     continue
 
                 for element in cell:
-                    if isinstance(element, AgentConstruct):
+                    if isinstance(element, SpatialAgent):
                         # Identify other agents using symbolic letter codes
                         for sym, info in agent_map.items():
                             if info["agent"] == element:
