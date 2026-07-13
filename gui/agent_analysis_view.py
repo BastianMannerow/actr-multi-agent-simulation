@@ -251,22 +251,23 @@ class AgentAnalysisView(QFrame):
         self.state_graph_view.setScene(build_state_transition_scene(analysis))
         self.state_graph_view.reset_zoom()
         findings = [
-            f"Initial state: {analysis.initial_state_label}",
-            "",
+            f"Initial control state: {analysis.states.get(analysis.initial_state_id).label if analysis.states.get(analysis.initial_state_id) else analysis.initial_state_label}",
+            f"Expanded productions: {len(analysis.productions)}",
+            f"Reachable productions: {sum(1 for item in analysis.productions if item.reachable)}",
             "Unreachable productions: "
             + (
                 ", ".join(analysis.unreachable_productions)
                 if analysis.unreachable_productions
                 else "none"
             ),
-            f"Dead-end states: {len(analysis.dead_end_states)}",
-            "Loop states: "
-            + (
-                ", ".join(analysis.loop_states)
-                if analysis.loop_states
-                else "none"
-            ),
+            "Dead-end states: "
+            + (", ".join(analysis.dead_end_states) if analysis.dead_end_states else "none"),
+            "Terminal states: "
+            + (", ".join(analysis.terminal_states) if analysis.terminal_states else "none"),
+            f"States participating in loops: {len(analysis.loop_states)}",
         ]
+        if analysis.analysis_warnings:
+            findings.extend(["", *analysis.analysis_warnings])
         self.state_findings.setPlainText("\n".join(findings))
 
     def _render_interactions(self, analysis: AgentStaticAnalysis) -> None:
@@ -279,7 +280,7 @@ class AgentAnalysisView(QFrame):
         self.production_graph_view.reset_zoom()
         self.adapter_graph_view.setScene(
             build_interaction_scene(
-                "Which adapter methods read or overwrite which buffers",
+                "Which adapter handlers read or overwrite which buffers",
                 analysis.adapter_interactions,
             )
         )

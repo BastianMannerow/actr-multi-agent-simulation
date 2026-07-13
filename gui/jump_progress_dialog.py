@@ -79,22 +79,40 @@ class JumpProgressDialog(QDialog):
         if not self._view_initialized:
             self.graph.reset_zoom()
             self._view_initialized = True
-        path = self.analysis.path_to_production(self.target_production)
-        if path is None:
+        transition_path = self.analysis.transition_path_to_production(
+            self.target_production
+        )
+        if transition_path is None:
             self.status_label.setText(
                 "Static path unavailable — monitoring runtime events only."
             )
             return
-        progress = 0
-        for production in fired:
-            if progress < len(path) and production.casefold() == path[progress].name.casefold():
-                progress += 1
-        if progress >= len(path):
+        fired_folded = [name.casefold() for name in fired]
+        completed = 0
+        consumed = 0
+        for transition in transition_path:
+            if transition.kind == "adapter":
+                trigger = (transition.trigger_production or "").casefold()
+                if trigger and trigger in fired_folded[:consumed]:
+                    completed += 1
+                    continue
+                break
+            while consumed < len(fired_folded):
+                current = fired_folded[consumed]
+                consumed += 1
+                if (transition.production_name or "").casefold() == current:
+                    completed += 1
+                    break
+            else:
+                break
+        if completed >= len(transition_path):
             self.status_label.setText("Target production fired.")
         else:
-            next_name = path[progress].name
+            next_transition = transition_path[completed]
+            prefix = "adapter" if next_transition.kind == "adapter" else "production"
             self.status_label.setText(
-                f"{progress}/{len(path)} path edges reached · next: {next_name}"
+                f"{completed}/{len(transition_path)} transitions reached · "
+                f"next {prefix}: {next_transition.label}"
             )
 
     def _fired_productions(self) -> list[str]:

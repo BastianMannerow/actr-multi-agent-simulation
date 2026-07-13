@@ -35,7 +35,20 @@ from PyQt6.QtWidgets import (
 )
 
 from simulation.inspection.declarative_memory import DeclarativeMemorySnapshot
-from simulation.inspection.source_analysis import AgentStaticAnalysis, MethodBufferInteraction
+from gui.graph_layout import (
+    LayoutEdge,
+    LayoutNode,
+    assign_label_positions,
+    layout_and_route,
+    route_fixed_nodes,
+    separate_overlapping_routes,
+)
+
+from simulation.inspection.source_analysis import (
+    AgentStaticAnalysis,
+    MethodBufferInteraction,
+    StateTransitionAnalysis,
+)
 
 
 SCENE_BACKGROUND = QColor("#0f172a")
@@ -144,225 +157,409 @@ class ZoomableGraphicsView(QGraphicsView):
 
 
 def build_state_transition_scene(analysis: AgentStaticAnalysis) -> QGraphicsScene:
-    """Build a collision-aware state graph with routed, labelled edges."""
+    """Render the reachable control graph with compact placement and orthogonal routing."""
     scene = _new_scene()
     _add_scene_title(scene, f"State transitions — {analysis.agent_type}")
     _add_legend(
         scene,
         [
-            ("Initial", QColor("#2563eb"), "box"),
-            ("Reachable", QColor("#0f766e"), "box"),
-            ("Loop", QColor("#7c3aed"), "box"),
+            ("Initial", QColor("#1d4ed8"), "box"),
+            ("Reachable", QColor("#047857"), "box"),
+            ("Adapter handoff", QColor("#b45309"), "box"),
+            ("Terminal", QColor("#0e7490"), "box"),
             ("Dead end", QColor("#be123c"), "box"),
-            ("Unreachable", QColor("#475569"), "box"),
+            ("Loop outline", QColor("#a855f7"), "line"),
+            ("Production", QColor("#7dd3fc"), "line"),
+            ("Adapter override", QColor("#f0abfc"), "dash"),
         ],
         y=52,
+        max_width=1500,
     )
 
-    initial = analysis.initial_state_label
-    graph: dict[str, set[str]] = defaultdict(set)
-    nodes: list[str] = []
-    for state in [initial, *[p.source_label for p in analysis.productions], *[p.target_label for p in analysis.productions]]:
-        if state not in nodes:
-            nodes.append(state)
-    for production in analysis.productions:
-        graph[production.source_label].add(production.target_label)
-        graph.setdefault(production.target_label, set())
-    for state in nodes:
-        graph.setdefault(state, set())
+    reachable_states = {
+        state_id: state
+        for state_id, state in analysis.states.items()
+        if state.reachable
+    }
+    transitions = [
+        transition
+        for transition in analysis.transitions
+        if transition.reachable
+        and transition.source_state_id in reachable_states
+        and transition.target_state_id in reachable_states
+    ]
+    if not reachable_states:
+        _add_empty_message(scene, "No reachable control states were detected.", y=118)
+        return scene
 
-    depths = _bfs_depths(graph, initial)
-    fallback_depth = max(depths.values(), default=0) + 1
-    columns: dict[int, list[str]] = defaultdict(list)
-    for state in nodes:
-        columns[depths.get(state, fallback_depth)].append(state)
-
-    font = QFont("Sans Serif", 9)
-    node_width = 310.0
-    column_gap = 220.0
-    row_gap = 110.0
-    top = 130.0
-    item_rects: dict[str, QRectF] = {}
-    for column, states in sorted(columns.items()):
-        y = top
-        for state in sorted(states):
-            wrapped = _wrap_label(state, 42)
-            size = _label_rect(wrapped, font, width=int(node_width), padding=24)
-            rect = QRectF(
-                40 + column * (node_width + column_gap),
-                y,
-                node_width,
-                max(74.0, size.height()),
-            )
-            item_rects[state] = rect
-            y += rect.height() + row_gap
-
-    dead_ends = set(analysis.dead_end_states)
-    loops = set(analysis.loop_states)
-    for state, rect in item_rects.items():
-        reachable = state in depths or state == initial
-        color = (
-            QColor("#2563eb")
-            if state == initial
-            else QColor("#be123c")
-            if state in dead_ends
-            else QColor("#7c3aed")
-            if state in loops
-            else QColor("#0f766e")
-            if reachable
-            else QColor("#475569")
+    layout_nodes = [
+        LayoutNode(
+            node_id=state_id,
+            label=state.label,
+            group=state.phase,
+            width=238.0,
+            height=76.0,
+            priority=(
+                100 if state_id == analysis.initial_state_id else
+                80 if state.terminal else
+                60 if state.adapter_handoff else
+                0
+            ),
         )
-        _add_node(scene, rect, state, color, wrap_width=42)
+        for state_id, state in reachable_states.items()
+    ]
+    layout_edges = [
+        LayoutEdge(
+            edge_id=transition.transition_id,
+            source_id=transition.source_state_id,
+            target_id=transition.target_state_id,
+            kind=transition.kind,
+            weight=1.25 if transition.kind == "adapter" else 1.0,
+        )
+        for transition in transitions
+    ]
+    geometry = layout_and_route(
+        layout_nodes,
+        layout_edges,
+        initial_node_id=analysis.initial_state_id,
+        offset=QPointF(42.0, 150.0),
+    )
 
-    pair_counts: dict[tuple[str, str], int] = defaultdict(int)
-    for production in analysis.productions:
-        pair_counts[(production.source_label, production.target_label)] += 1
-    pair_index: dict[tuple[str, str], int] = defaultdict(int)
+    header_font = QFont("Sans Serif", 10)
+    header_font.setBold(True)
+    for phase, point in geometry.group_headers.items():
+        header = QGraphicsSimpleTextItem(phase.upper())
+        header.setFont(header_font)
+        header.setBrush(QBrush(QColor("#cbd5e1")))
+        header.setPos(point.x(), point.y())
+        scene.addItem(header)
 
-    for production in analysis.productions:
-        source = item_rects[production.source_label]
-        target = item_rects[production.target_label]
-        key = (production.source_label, production.target_label)
-        index = pair_index[key]
-        pair_index[key] += 1
-        color = QColor("#e2e8f0") if production.reachable else QColor("#64748b")
-        pen = QPen(color, 2.2 if production.reachable else 1.6)
-        if not production.reachable:
-            pen.setStyle(Qt.PenStyle.DashLine)
+    for state_id, placement in geometry.placements.items():
+        state = reachable_states[state_id]
+        color = (
+            QColor("#1d4ed8")
+            if state_id == analysis.initial_state_id
+            else QColor("#be123c")
+            if state.dead_end
+            else QColor("#0e7490")
+            if state.terminal
+            else QColor("#b45309")
+            if state.adapter_handoff
+            else QColor("#047857")
+        )
+        border = QColor("#a855f7") if state.loop_member else QColor("#dbe4f0")
+        _add_node(
+            scene,
+            placement.rect,
+            state.label,
+            color,
+            wrap_width=26,
+            border_color=border,
+            border_width=2.6 if state.loop_member else 1.5,
+        )
 
-        if source == target:
-            anchor = QPointF(source.right(), source.center().y())
-            loop_extent = 90 + index * 34
-            path = QPainterPath(anchor)
-            path.cubicTo(
-                anchor + QPointF(loop_extent, loop_extent),
-                anchor + QPointF(loop_extent * 1.8, loop_extent),
-                anchor + QPointF(loop_extent * 1.8, 0),
+    display_routes = separate_overlapping_routes(
+        geometry.routes.values(),
+        placements=geometry.placements,
+    )
+    label_positions = assign_label_positions(
+        display_routes.values(),
+        [placement.rect for placement in geometry.placements.values()],
+    )
+
+    transition_by_id = {item.transition_id: item for item in transitions}
+
+    # Number production and adapter transitions independently in deterministic
+    # graph order.  The same order is reused by the detail catalogue below, so
+    # P1..Pn and A1..An can be found without scanning a mixed list.
+    ordered_transitions = _ordered_transitions_for_codes(transitions, geometry)
+    code_by_id: dict[str, str] = {}
+    counters = {"production": 0, "adapter": 0}
+    for transition in ordered_transitions:
+        counters[transition.kind] += 1
+        prefix = "A" if transition.kind == "adapter" else "P"
+        code_by_id[transition.transition_id] = f"{prefix}{counters[transition.kind]}"
+
+    details_by_kind: dict[str, list[tuple[str, str, QColor]]] = {
+        "production": [],
+        "adapter": [],
+    }
+    for edge_id, route in display_routes.items():
+        transition = transition_by_id[edge_id]
+        code = code_by_id[edge_id]
+        color = QColor("#f0abfc") if transition.kind == "adapter" else QColor("#7dd3fc")
+
+        # A wide background-coloured underlay creates a visual bridge at every
+        # crossing.  Dashed adapter edges therefore never disappear into solid
+        # production edges, even when they cross at the same coordinate.
+        halo_pen = QPen(SCENE_BACKGROUND, 7.0)
+        halo_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        halo_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        halo_item = _add_polyline_path(scene, route.points, halo_pen)
+        halo_item.setZValue(0.0)
+
+        pen = QPen(color, 2.4 if transition.kind == "adapter" else 2.25)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        if transition.kind == "adapter":
+            pen.setStyle(Qt.PenStyle.CustomDashLine)
+            pen.setDashPattern([7.0, 4.0])
+            pen.setDashOffset((_numeric_code(code) % 4) * 2.0)
+        path_item = _add_polyline_path(scene, route.points, pen)
+        path_item.setZValue(1.0)
+        tooltip = (
+            f"{code} · {transition.kind}: {transition.label}\n"
+            f"Guard: {transition.guard_label or 'none'}\n"
+            f"Actions: {transition.action_label or 'control-state update'}"
+        )
+        path_item.setToolTip(tooltip)
+        if len(route.points) >= 2:
+            _draw_arrow(scene, route.points[-2], route.points[-1], color)
+        label = _add_edge_label(
+            scene, code, label_positions[edge_id], color
+        )
+        label.setToolTip(tooltip)
+        source = reachable_states[transition.source_state_id]
+        target = reachable_states[transition.target_state_id]
+        detail = transition.label
+        if transition.guard_label:
+            detail += f" | guard: {transition.guard_label.replace(chr(10), '; ')}"
+        if transition.action_label:
+            detail += f" | action: {transition.action_label.replace(chr(10), '; ')}"
+        details_by_kind[transition.kind].append(
+            (
+                code,
+                f"{source.label} → {target.label}\n{detail}",
+                color,
             )
-            path.cubicTo(
-                anchor + QPointF(loop_extent * 1.8, -loop_extent * 0.35),
-                anchor + QPointF(loop_extent, -loop_extent * 0.35),
-                anchor,
+        )
+
+    _add_route_bundle_markers(scene, list(display_routes.values()))
+
+    details_y = geometry.bounds.bottom() + 100.0
+    details_font = QFont("Sans Serif", 10)
+    details_font.setBold(True)
+    detail_columns = 3
+    detail_width = 600.0
+    detail_height = 104.0
+
+    current_y = details_y
+    for kind, heading_text in (
+        ("production", "Production transitions"),
+        ("adapter", "Adapter overrides"),
+    ):
+        values = sorted(
+            details_by_kind[kind],
+            key=lambda item: _numeric_code(item[0]),
+        )
+        if not values:
+            continue
+        first_code = values[0][0]
+        last_code = values[-1][0]
+        heading = QGraphicsSimpleTextItem(
+            f"{heading_text} · {first_code}–{last_code} · layout: {geometry.orientation}"
+        )
+        heading.setFont(details_font)
+        heading.setBrush(QBrush(QColor("#f8fafc")))
+        heading.setPos(42.0, current_y)
+        scene.addItem(heading)
+
+        for index, (code, detail, color) in enumerate(values):
+            column = index % detail_columns
+            row = index // detail_columns
+            x = 42.0 + column * (detail_width + 24.0)
+            y = current_y + 38.0 + row * (detail_height + 18.0)
+            _add_node(
+                scene,
+                QRectF(x, y, 58.0, detail_height),
+                code,
+                QColor("#312e81") if code.startswith("P") else QColor("#86198f"),
+                wrap_width=6,
+                border_color=color,
+                border_width=2.0,
             )
-            _add_path(scene, path, pen)
-            _draw_arrow(scene, anchor + QPointF(14, 5), anchor, color)
-            label_pos = anchor + QPointF(loop_extent * 0.9, loop_extent + 10)
-        elif target.left() >= source.right():
-            start = QPointF(source.right(), source.center().y())
-            end = QPointF(target.left(), target.center().y())
-            duplicate_offset = (index - (pair_counts[key] - 1) / 2) * 28
-            mid_x = (start.x() + end.x()) / 2 + duplicate_offset
-            path = QPainterPath(start)
-            path.cubicTo(
-                QPointF(mid_x, start.y()),
-                QPointF(mid_x, end.y()),
-                end,
+            text_item = QGraphicsTextItem(_wrap_label(detail, 70))
+            text_item.setDefaultTextColor(QColor("#e2e8f0"))
+            text_item.setTextWidth(detail_width - 72.0)
+            text_item.setPos(x + 70.0, y + 4.0)
+            scene.addItem(text_item)
+        rows = (len(values) + detail_columns - 1) // detail_columns
+        current_y += 38.0 + rows * (detail_height + 18.0) + 54.0
+
+    unreachable_y = current_y
+    if analysis.unreachable_productions:
+        unreachable_heading = QGraphicsSimpleTextItem("Statically unreachable productions")
+        unreachable_heading.setFont(details_font)
+        unreachable_heading.setBrush(QBrush(QColor("#f8fafc")))
+        unreachable_heading.setPos(42.0, unreachable_y)
+        scene.addItem(unreachable_heading)
+        production_by_name = {item.name: item for item in analysis.productions}
+        columns = 3
+        cell_width = 430.0
+        for index, name in enumerate(analysis.unreachable_productions):
+            production = production_by_name[name]
+            source_state = analysis.states.get(production.source_state_id)
+            target_state = analysis.states.get(production.target_state_id)
+            value = (
+                f"{name}\n"
+                f"{source_state.label if source_state else '?'} → "
+                f"{target_state.label if target_state else '?'}"
             )
-            _add_path(scene, path, pen)
-            _draw_arrow(scene, QPointF(mid_x, end.y()), end, color)
-            label_pos = QPointF(mid_x - 70, (start.y() + end.y()) / 2 - 14)
-        else:
-            start = QPointF(source.left(), source.center().y())
-            end = QPointF(target.right(), target.center().y())
-            route_y = min(source.top(), target.top()) - 70 - index * 34
-            path = QPainterPath(start)
-            path.lineTo(start.x() - 46, start.y())
-            path.lineTo(start.x() - 46, route_y)
-            path.lineTo(end.x() + 46, route_y)
-            path.lineTo(end.x() + 46, end.y())
-            path.lineTo(end)
-            _add_path(scene, path, pen)
-            _draw_arrow(scene, QPointF(end.x() + 46, end.y()), end, color)
-            label_pos = QPointF((start.x() + end.x()) / 2 - 70, route_y - 24)
-        _add_edge_label(scene, production.name, label_pos, color)
+            column = index % columns
+            row = index // columns
+            _add_node(
+                scene,
+                QRectF(
+                    42.0 + column * (cell_width + 26.0),
+                    unreachable_y + 42.0 + row * 92.0,
+                    cell_width,
+                    70.0,
+                ),
+                value,
+                QColor("#334155"),
+                wrap_width=52,
+                border_color=QColor("#64748b"),
+            )
     return scene
-
 
 def build_interaction_scene(
     title: str,
     interactions: Iterable[MethodBufferInteraction],
 ) -> QGraphicsScene:
-    """Build a routed bipartite graph without overlapping connection lines."""
+    """Render interactions as a matrix, eliminating ambiguous crossing edges."""
     scene = _new_scene()
     _add_scene_title(scene, title)
     _add_legend(
         scene,
         [
-            ("Read", QColor("#60a5fa"), "line"),
-            ("Write", QColor("#f59e0b"), "line"),
-            ("Delete / clear", QColor("#fb7185"), "line"),
+            ("Read", QColor("#1d4ed8"), "box"),
+            ("Write / request", QColor("#b45309"), "box"),
+            ("Read + write", QColor("#6d28d9"), "box"),
+            ("Delete / clear", QColor("#be123c"), "box"),
         ],
         y=50,
+        max_width=1200,
     )
     rows = list(interactions)
     if not rows:
-        _add_empty_message(scene, "No buffer interactions were detected.")
+        _add_empty_message(scene, "No buffer interactions were detected.", y=104)
         return scene
 
     actors = sorted({row.method_name for row in rows}, key=str.lower)
     buffers = sorted({row.buffer_name for row in rows}, key=str.lower)
-    actor_height = 60.0
-    buffer_height = 60.0
-    spacing = 92.0
-    left_x, left_width = 40.0, 310.0
-    right_x, right_width = 920.0, 260.0
-    top = 125.0
-    actor_rects: dict[str, QRectF] = {}
-    buffer_rects: dict[str, QRectF] = {}
-    for index, actor in enumerate(actors):
-        rect = QRectF(left_x, top + index * spacing, left_width, actor_height)
-        actor_rects[actor] = rect
-        _add_node(scene, rect, actor, QColor("#1e3a8a"), wrap_width=38)
-    for index, buffer_name in enumerate(buffers):
-        rect = QRectF(right_x, top + index * spacing, right_width, buffer_height)
-        buffer_rects[buffer_name] = rect
-        _add_node(scene, rect, buffer_name, QColor("#166534"), wrap_width=30)
+    actor_width = 330.0
+    cell_width = 132.0
+    row_height = 72.0
+    header_y = 126.0
+    body_y = 212.0
+    left = 36.0
 
-    actor_edges: dict[str, list[MethodBufferInteraction]] = defaultdict(list)
-    buffer_edges: dict[str, list[MethodBufferInteraction]] = defaultdict(list)
-    for row in rows:
-        actor_edges[row.method_name].append(row)
-        buffer_edges[row.buffer_name].append(row)
+    actor_map: dict[str, list[MethodBufferInteraction]] = defaultdict(list)
+    cell_map: dict[tuple[str, str], list[MethodBufferInteraction]] = defaultdict(list)
+    for interaction in rows:
+        actor_map[interaction.method_name].append(interaction)
+        cell_map[(interaction.method_name, interaction.buffer_name)].append(interaction)
 
-    for lane, row in enumerate(rows):
-        source = actor_rects[row.method_name]
-        target = buffer_rects[row.buffer_name]
-        source_rows = actor_edges[row.method_name]
-        target_rows = buffer_edges[row.buffer_name]
-        source_index = source_rows.index(row)
-        target_index = target_rows.index(row)
-        start = QPointF(
-            source.right(),
-            source.top() + (source_index + 1) * source.height() / (len(source_rows) + 1),
+    actor_header = QGraphicsSimpleTextItem("Production / adapter handler")
+    actor_header.setBrush(QBrush(QColor("#cbd5e1")))
+    actor_header.setPos(left, header_y + 22)
+    scene.addItem(actor_header)
+    for column, buffer_name in enumerate(buffers):
+        rect = QRectF(
+            left + actor_width + 18 + column * cell_width,
+            header_y,
+            cell_width - 8,
+            64,
         )
-        end = QPointF(
-            target.left(),
-            target.top() + (target_index + 1) * target.height() / (len(target_rows) + 1),
-        )
-        lane_x = 430.0 + lane * 24.0
-        mode = row.mode.lower()
-        color = (
-            QColor("#f59e0b")
-            if mode in {"write", "request"}
-            else QColor("#fb7185")
-            if mode in {"delete", "clear"}
-            else QColor("#60a5fa")
-        )
-        pen = QPen(color, 2.0)
-        path = QPainterPath(start)
-        path.lineTo(lane_x, start.y())
-        path.lineTo(lane_x, end.y())
-        path.lineTo(end)
-        _add_path(scene, path, pen)
-        _draw_arrow(scene, QPointF(lane_x, end.y()), end, color)
-        _add_edge_label(
+        _add_node(
             scene,
-            row.mode,
-            QPointF(lane_x + 5, (start.y() + end.y()) / 2 - 12),
-            color,
+            rect,
+            buffer_name,
+            QColor("#14532d"),
+            wrap_width=18,
+            border_color=QColor("#86efac"),
         )
-    return scene
 
+    trigger_x = left + actor_width + 18 + len(buffers) * cell_width + 22
+    has_triggers = any(item.triggered_by for item in rows)
+    if has_triggers:
+        trigger_header = QGraphicsSimpleTextItem("Triggered after production")
+        trigger_header.setBrush(QBrush(QColor("#cbd5e1")))
+        trigger_header.setPos(trigger_x, header_y + 22)
+        scene.addItem(trigger_header)
+
+    for row_index, actor in enumerate(actors):
+        y = body_y + row_index * row_height
+        interactions_for_actor = actor_map[actor]
+        actor_label = actor
+        actor_rect = QRectF(left, y, actor_width, 54)
+        _add_node(
+            scene,
+            actor_rect,
+            actor_label,
+            QColor("#1e3a8a"),
+            wrap_width=38,
+        )
+        for column, buffer_name in enumerate(buffers):
+            cell = cell_map.get((actor, buffer_name), [])
+            rect = QRectF(
+                left + actor_width + 18 + column * cell_width,
+                y,
+                cell_width - 8,
+                54,
+            )
+            if not cell:
+                empty = QGraphicsRectItem(rect)
+                empty.setPen(QPen(QColor("#334155"), 0.8))
+                empty.setBrush(QBrush(QColor("#111827")))
+                scene.addItem(empty)
+                continue
+            modes = {item.mode.lower() for item in cell}
+            has_read = bool(modes & {"read", "query"})
+            has_write = bool(modes & {"write", "request"})
+            has_delete = bool(modes & {"delete", "clear"})
+            if has_delete:
+                color = QColor("#be123c")
+                code = "D"
+            elif has_read and has_write:
+                color = QColor("#6d28d9")
+                code = "R/W"
+            elif has_write:
+                color = QColor("#b45309")
+                code = "W"
+            else:
+                color = QColor("#1d4ed8")
+                code = "R"
+            _add_node(
+                scene,
+                rect,
+                code,
+                color,
+                wrap_width=8,
+                border_color=QColor("#e2e8f0"),
+            )
+            tooltip = "\n\n".join(
+                f"{item.mode}: {item.function_name}\n{item.detail or ''}"
+                for item in cell
+            )
+            for graphics_item in scene.items(rect):
+                graphics_item.setToolTip(tooltip)
+        if has_triggers:
+            triggers = sorted(
+                {
+                    trigger
+                    for item in interactions_for_actor
+                    for trigger in item.triggered_by
+                },
+                key=str.lower,
+            )
+            trigger_text = ", ".join(triggers) if triggers else "—"
+            trigger_item = QGraphicsTextItem(_wrap_label(trigger_text, 42))
+            trigger_item.setDefaultTextColor(QColor("#e2e8f0"))
+            trigger_item.setTextWidth(310)
+            trigger_item.setPos(trigger_x, y + 4)
+            scene.addItem(trigger_item)
+    return scene
 
 def build_buffer_history_scene(
     agent_name: str,
@@ -429,14 +626,14 @@ def build_jump_progress_scene(
     target_production: str,
     fired_productions: list[str],
 ) -> QGraphicsScene:
-    """Render a target path and highlight productions fired in order."""
+    """Render a jump path including adapter overrides between productions."""
     scene = _new_scene()
     _add_scene_title(scene, f"Jump path to production: {target_production}")
-    path = analysis.path_to_production(target_production)
+    path = analysis.transition_path_to_production(target_production)
     if not path:
         warning = QGraphicsTextItem(
-            "No statically reachable path could be derived. Adapter side effects "
-            "or dynamic buffer changes may still make the target reachable."
+            "No statically reachable path could be derived. The target is shown "
+            "without claiming that it is reachable."
         )
         warning.setDefaultTextColor(QColor("#fecaca"))
         warning.setTextWidth(760)
@@ -444,225 +641,336 @@ def build_jump_progress_scene(
         scene.addItem(warning)
         target = analysis.production(target_production)
         if target is not None:
-            _add_node(scene, QRectF(30, 170, 330, 96), target.source_label, QColor("#7f1d1d"))
-            _add_edge_label(scene, target.name, QPointF(420, 202), QColor("#fecaca"))
-            _add_node(scene, QRectF(610, 170, 330, 96), target.target_label, QColor("#7f1d1d"))
+            source = analysis.states.get(target.source_state_id)
+            destination = analysis.states.get(target.target_state_id)
+            _add_node(
+                scene,
+                QRectF(30, 170, 280, 88),
+                source.label if source else target.source_label,
+                QColor("#7f1d1d"),
+            )
+            _add_edge_label(scene, target.name, QPointF(350, 196), QColor("#fecaca"))
+            _add_node(
+                scene,
+                QRectF(590, 170, 280, 88),
+                destination.label if destination else target.target_label,
+                QColor("#7f1d1d"),
+            )
         return scene
 
-    progress = _ordered_path_progress(path, fired_productions)
-    node_width, node_height, spacing = 300.0, 96.0, 190.0
+    progress = _ordered_transition_progress(path, fired_productions)
+    node_width, node_height, spacing = 245.0, 82.0, 150.0
     y = 150.0
-    states = analysis.state_sequence_for_path(path)
+    states = analysis.state_sequence_for_transition_path(path)
     for index, state in enumerate(states):
         x = 30 + index * (node_width + spacing)
         color = (
-            QColor("#6b21a8")
+            QColor("#0e7490")
             if index == len(states) - 1 and progress >= len(path)
-            else QColor("#166534")
+            else QColor("#047857")
             if index <= progress
-            else QColor("#075985")
-            if index == progress + 1
             else QColor("#334155")
         )
-        _add_node(scene, QRectF(x, y, node_width, node_height), state, color, wrap_width=40)
+        _add_node(
+            scene,
+            QRectF(x, y, node_width, node_height),
+            state,
+            color,
+            wrap_width=28,
+        )
 
-    for index, production in enumerate(path):
+    for index, transition in enumerate(path):
         source_x = 30 + index * (node_width + spacing) + node_width
         target_x = 30 + (index + 1) * (node_width + spacing)
         start = QPointF(source_x, y + node_height / 2)
         end = QPointF(target_x, y + node_height / 2)
         completed = index < progress
         active = index == progress and progress < len(path)
-        color = QColor("#22c55e") if completed else QColor("#38bdf8") if active else QColor("#64748b")
-        route_y = y + node_height / 2 + (index % 2) * 30 - 15
+        base = QColor("#f0abfc") if transition.kind == "adapter" else QColor("#7dd3fc")
+        color = QColor("#22c55e") if completed else base if active else QColor("#64748b")
+        pen = QPen(color, 3.0 if completed or active else 2.0)
+        if transition.kind == "adapter":
+            pen.setStyle(Qt.PenStyle.DashLine)
         graph_path = QPainterPath(start)
         graph_path.cubicTo(
-            QPointF((start.x() + end.x()) / 2, route_y),
-            QPointF((start.x() + end.x()) / 2, route_y),
+            QPointF((start.x() + end.x()) / 2, y + 18),
+            QPointF((start.x() + end.x()) / 2, y + node_height - 18),
             end,
         )
-        _add_path(scene, graph_path, QPen(color, 3.0 if completed or active else 2.0))
-        _draw_arrow(scene, QPointF((start.x() + end.x()) / 2, route_y), end, color)
-        _add_edge_label(scene, production.name, QPointF(source_x + 40, y - 44), color)
-        condition = QGraphicsTextItem("Requires:\n" + _wrap_label(production.source_label, 32))
-        condition.setDefaultTextColor(MUTED_TEXT)
-        condition.setTextWidth(spacing - 20)
-        condition.setPos(source_x + 8, y + node_height + 20)
-        scene.addItem(condition)
+        _add_path(scene, graph_path, pen)
+        _draw_arrow(scene, QPointF((start.x() + end.x()) / 2, y + node_height / 2), end, color)
+        label = transition.label
+        if transition.guard_label:
+            label += "\n[" + transition.guard_label.replace("\n", "; ") + "]"
+        _add_edge_label(scene, label, QPointF(source_x + 18, y - 55), color)
 
     status = QGraphicsSimpleTextItem(
         "Target production fired."
         if progress >= len(path)
-        else f"Reached {progress} of {len(path)} required production steps."
+        else f"Reached {progress} of {len(path)} control-flow transitions."
     )
-    status.setBrush(QBrush(QColor("#86efac") if progress >= len(path) else QColor("#bae6fd")))
+    status.setBrush(
+        QBrush(QColor("#86efac") if progress >= len(path) else QColor("#bae6fd"))
+    )
     status.setPos(24, 78)
     scene.addItem(status)
     return scene
-
 
 def build_declarative_memory_scene(
     snapshot: DeclarativeMemorySnapshot,
     *,
     title: str,
 ) -> QGraphicsScene:
-    """Render memories, chunks, operations, and inferred links without overlap."""
+    """Render memory contents and operations with obstacle-aware orthogonal routes."""
     scene = _new_scene()
     _add_scene_title(scene, title)
     _add_legend(
         scene,
         [
-            ("Memory", QColor("#2563eb"), "box"),
+            ("Memory", QColor("#1d4ed8"), "box"),
             ("Runtime chunk", QColor("#0f766e"), "box"),
-            ("Static chunk", QColor("#7c3aed"), "box"),
-            ("Explicit reference", QColor("#38bdf8"), "line"),
+            ("Explicit static DM chunk", QColor("#6d28d9"), "box"),
+            ("Buffer harvest/retrieval link", QColor("#22d3ee"), "dash"),
+            ("Explicit memory write", QColor("#f59e0b"), "line"),
+            ("Chunk reference", QColor("#38bdf8"), "line"),
             ("Shared value", QColor("#94a3b8"), "dash"),
-            ("Read", QColor("#60a5fa"), "line"),
-            ("Write", QColor("#f59e0b"), "line"),
-            ("Delete", QColor("#fb7185"), "line"),
         ],
         y=52,
-        max_width=1180,
+        max_width=1500,
     )
 
-    if not snapshot.memories and not snapshot.chunks:
-        _add_empty_message(
-            scene,
-            "No declarative-memory chunks were detected. The memory may be populated later during simulation.",
-            y=118,
-        )
+    memory_names = snapshot.memories or sorted(
+        {chunk.memory_name for chunk in snapshot.chunks}
+    )
+    if not memory_names:
+        _add_empty_message(scene, "No declarative memory was detected.", y=118)
         return scene
 
-    memory_names = snapshot.memories or sorted({chunk.memory_name for chunk in snapshot.chunks})
-    chunks_by_memory: dict[str, list[Any]] = {name: [] for name in memory_names}
+    buffer_links = [
+        operation
+        for operation in snapshot.operations
+        if str(operation.get("mode")) == "buffer_link"
+    ]
+    memory_ops = [
+        operation
+        for operation in snapshot.operations
+        if str(operation.get("mode")) != "buffer_link"
+    ]
+    chunks_by_memory: dict[str, list[Any]] = defaultdict(list)
     for chunk in snapshot.chunks:
-        chunks_by_memory.setdefault(chunk.memory_name, []).append(chunk)
+        chunks_by_memory[chunk.memory_name].append(chunk)
 
-    column_width = 330.0
-    column_gap = 170.0
-    chunk_gap = 52.0
-    header_y = 125.0
-    chunk_y = 235.0
-    memory_rects: dict[str, QRectF] = {}
-    chunk_rects: dict[str, QRectF] = {}
-    memory_index: dict[str, int] = {}
-    max_bottom = chunk_y
+    node_rects: dict[str, QRectF] = {}
+    node_specs: dict[str, tuple[str, QColor, int, QColor | None]] = {}
+    edge_specs: list[tuple[LayoutEdge, QColor, Qt.PenStyle, str]] = []
 
-    for index, memory_name in enumerate(memory_names):
-        x = 40 + index * (column_width + column_gap)
-        memory_index[memory_name] = index
-        header = QRectF(x, header_y, column_width, 62)
-        memory_rects[memory_name] = header
-        _add_node(scene, header, f"Memory: {memory_name}", QColor("#2563eb"), wrap_width=38)
-        y = chunk_y
-        for chunk in chunks_by_memory.get(memory_name, []):
-            activation = f"activation={chunk.activation:.3f}" if chunk.activation is not None else ""
-            traces = (
-                "traces=" + ", ".join(f"{value:.3f}" for value in chunk.traces[-4:])
-                if chunk.traces
-                else ""
+    top = 150.0
+    left_x = 36.0
+    buffer_width = 320.0
+    center_x = 520.0
+    memory_width = 330.0
+    memory_column_gap = 470.0
+
+    if buffer_links:
+        heading = QGraphicsSimpleTextItem("Buffers linked by pyactr simulation()")
+        heading.setBrush(QBrush(QColor("#f8fafc")))
+        heading.setPos(left_x, top - 38.0)
+        scene.addItem(heading)
+    for index, operation in enumerate(buffer_links):
+        node_id = f"buffer:{index}"
+        rect = QRectF(left_x, top + index * 88.0, buffer_width, 58.0)
+        node_rects[node_id] = rect
+        node_specs[node_id] = (
+            str(operation.get("actor", "buffer")),
+            QColor("#155e75"),
+            38,
+            QColor("#a5f3fc"),
+        )
+
+    memory_rects: dict[str, str] = {}
+    chunk_ids: dict[str, str] = {}
+    max_memory_bottom = top
+    for memory_index, memory_name in enumerate(memory_names):
+        x = center_x + memory_index * memory_column_gap
+        memory_id = f"memory:{memory_name}"
+        memory_rects[memory_name] = memory_id
+        memory_rect = QRectF(x, top, memory_width, 70.0)
+        node_rects[memory_id] = memory_rect
+        node_specs[memory_id] = (
+            f"Memory: {memory_name}", QColor("#1d4ed8"), 36, QColor("#bfdbfe")
+        )
+        y = memory_rect.bottom() + 58.0
+        for chunk_index, chunk in enumerate(chunks_by_memory.get(memory_name, [])):
+            detail = chunk.label
+            if chunk.traces:
+                detail += "\ntraces=" + ", ".join(
+                    f"{value:.3f}" for value in chunk.traces[-4:]
+                )
+            if chunk.activation is not None:
+                detail += f"\nactivation={chunk.activation:.3f}"
+            height = max(
+                90.0,
+                _label_rect(
+                    _wrap_label(detail, 40), QFont("Sans Serif", 9), memory_width, 28
+                ).height(),
             )
-            detail = " · ".join(value for value in (activation, traces) if value)
-            label = chunk.label + (f"\n{detail}" if detail else "")
-            wrapped = _wrap_label(label, 42)
-            height = max(98.0, _label_rect(wrapped, QFont("Sans Serif", 9), int(column_width), 26).height())
-            rect = QRectF(x, y, column_width, height)
-            chunk_rects[chunk.chunk_id] = rect
-            color = QColor("#0f766e") if chunk.source == "runtime" else QColor("#7c3aed")
-            _add_node(scene, rect, label, color, wrap_width=42)
-            link_path = QPainterPath(QPointF(header.center().x(), header.bottom()))
-            link_path.lineTo(QPointF(header.center().x(), rect.top()))
-            _add_path(scene, link_path, QPen(QColor("#64748b"), 1.4))
-            y += rect.height() + chunk_gap
-            max_bottom = max(max_bottom, rect.bottom())
+            chunk_node_id = f"chunk:{chunk.chunk_id}"
+            chunk_ids[chunk.chunk_id] = chunk_node_id
+            rect = QRectF(x, y, memory_width, height)
+            node_rects[chunk_node_id] = rect
+            node_specs[chunk_node_id] = (
+                detail,
+                QColor("#0f766e") if chunk.source == "runtime" else QColor("#6d28d9"),
+                40,
+                QColor("#dbeafe"),
+            )
+            edge_specs.append(
+                (
+                    LayoutEdge(
+                        f"contains:{memory_name}:{chunk_index}",
+                        memory_id,
+                        chunk_node_id,
+                        "contains",
+                    ),
+                    QColor("#64748b"),
+                    Qt.PenStyle.SolidLine,
+                    "",
+                )
+            )
+            y += height + 52.0
+        max_memory_bottom = max(max_memory_bottom, y)
 
-    same_memory_lane: dict[str, int] = defaultdict(int)
-    cross_lane = 0
-    for edge in snapshot.edges:
-        source = chunk_rects.get(edge.source_id)
-        target = chunk_rects.get(edge.target_id)
+    # Place explicit operations below the tallest memory column so their routes
+    # do not pass through chunks or buffer nodes.
+    operations_y = max(
+        max_memory_bottom + 80.0,
+        top + max(1, len(buffer_links)) * 88.0 + 90.0,
+    )
+    if memory_ops:
+        heading = QGraphicsSimpleTextItem("Explicit memory operations")
+        heading.setBrush(QBrush(QColor("#f8fafc")))
+        heading.setPos(left_x, operations_y - 42.0)
+        scene.addItem(heading)
+    for index, operation in enumerate(memory_ops):
+        column = index % 2
+        row = index // 2
+        node_id = f"operation:{index}"
+        x = left_x + column * 390.0
+        y = operations_y + row * 112.0
+        rect = QRectF(x, y, 350.0, 78.0)
+        mode = str(operation.get("mode", "access"))
+        color = (
+            QColor("#be123c")
+            if mode in {"delete", "clear"}
+            else QColor("#f59e0b")
+            if mode in {"write", "add"}
+            else QColor("#1d4ed8")
+        )
+        label = (
+            f"{operation.get('actor', 'code')}\n"
+            f"{mode} → {operation.get('memory_name', 'decmem')}\n"
+            f"{operation.get('detail', '')}"
+        )
+        node_rects[node_id] = rect
+        node_specs[node_id] = (label, color, 44, QColor("#e2e8f0"))
+
+    # Add all semantic edges after every obstacle is known.
+    for index, operation in enumerate(buffer_links):
+        target = memory_rects.get(str(operation.get("memory_name", "decmem")))
+        if target:
+            edge_specs.append(
+                (
+                    LayoutEdge(f"buffer-link:{index}", f"buffer:{index}", target, "buffer_link"),
+                    QColor("#22d3ee"),
+                    Qt.PenStyle.DashLine,
+                    "",
+                )
+            )
+    for index, operation in enumerate(memory_ops):
+        target = memory_rects.get(str(operation.get("memory_name", "decmem")))
+        if target:
+            mode = str(operation.get("mode", "access"))
+            color = (
+                QColor("#be123c")
+                if mode in {"delete", "clear"}
+                else QColor("#f59e0b")
+                if mode in {"write", "add"}
+                else QColor("#1d4ed8")
+            )
+            edge_specs.append(
+                (
+                    LayoutEdge(f"memory-op:{index}", f"operation:{index}", target, mode),
+                    color,
+                    Qt.PenStyle.SolidLine,
+                    mode,
+                )
+            )
+    for index, edge in enumerate(snapshot.edges):
+        source = chunk_ids.get(edge.source_id)
+        target = chunk_ids.get(edge.target_id)
         if source is None or target is None:
             continue
         color = QColor("#38bdf8") if edge.relation == "reference" else QColor("#94a3b8")
-        pen = QPen(color, 2.2 if edge.relation == "reference" else 1.4)
-        if edge.relation != "reference":
-            pen.setStyle(Qt.PenStyle.DashLine)
+        style = Qt.PenStyle.SolidLine if edge.relation == "reference" else Qt.PenStyle.DashLine
+        edge_specs.append(
+            (
+                LayoutEdge(f"chunk-edge:{index}", source, target, edge.relation),
+                color,
+                style,
+                edge.label,
+            )
+        )
 
-        source_chunk = next((c for c in snapshot.chunks if c.chunk_id == edge.source_id), None)
-        target_chunk = next((c for c in snapshot.chunks if c.chunk_id == edge.target_id), None)
-        same_memory = source_chunk is not None and target_chunk is not None and source_chunk.memory_name == target_chunk.memory_name
-        if same_memory and source_chunk is not None:
-            lane = same_memory_lane[source_chunk.memory_name]
-            same_memory_lane[source_chunk.memory_name] += 1
-            side_x = source.right() + 46 + lane * 24
-            start = QPointF(source.right(), source.center().y())
-            end = QPointF(target.right(), target.center().y())
-            path = QPainterPath(start)
-            path.lineTo(side_x, start.y())
-            path.lineTo(side_x, end.y())
-            path.lineTo(end)
-            label_pos = QPointF(side_x + 6, (start.y() + end.y()) / 2 - 12)
-            arrow_from = QPointF(side_x, end.y())
-        else:
-            lane = cross_lane
-            cross_lane += 1
-            start = QPointF(source.center().x(), source.bottom())
-            end = QPointF(target.center().x(), target.bottom())
-            route_y = max_bottom + 70 + lane * 30
-            path = QPainterPath(start)
-            path.lineTo(start.x(), route_y)
-            path.lineTo(end.x(), route_y)
-            path.lineTo(end)
-            label_pos = QPointF((start.x() + end.x()) / 2 - 65, route_y - 24)
-            arrow_from = QPointF(end.x(), route_y)
-        _add_path(scene, path, pen)
-        _draw_arrow(scene, arrow_from, end, color)
-        _add_edge_label(scene, edge.label, label_pos, color)
+    for node_id, rect in node_rects.items():
+        label, color, wrap, border = node_specs[node_id]
+        _add_node(
+            scene, rect, label, color, wrap_width=wrap, border_color=border
+        )
 
-    operations_top = max_bottom + 120 + cross_lane * 30
-    if snapshot.operations:
-        heading = QGraphicsSimpleTextItem("Memory operations")
-        heading.setBrush(QBrush(TEXT_COLOR))
-        heading.setPos(24, operations_top - 42)
-        scene.addItem(heading)
-        for index, operation in enumerate(snapshot.operations):
-            column = index % max(1, min(3, len(memory_names) or 3))
-            row = index // max(1, min(3, len(memory_names) or 3))
-            x = 40 + column * 390
-            y = operations_top + row * 112
-            actor = str(operation.get("actor", "code"))
-            mode = str(operation.get("mode", "access")).lower()
-            memory_name = str(operation.get("memory_name", "decmem"))
-            detail = str(operation.get("detail", ""))
-            label = f"{actor}\n{mode} → {memory_name}" + (f"\n{detail}" if detail else "")
-            color = QColor("#fb7185") if mode in {"delete", "clear"} else QColor("#f59e0b") if mode in {"write", "add"} else QColor("#60a5fa")
-            rect = QRectF(x, y, 340, 78)
-            _add_node(scene, rect, label, color, wrap_width=42)
-            target = memory_rects.get(memory_name)
-            if target is not None:
-                start = QPointF(rect.center().x(), rect.top())
-                end = QPointF(target.center().x(), target.bottom())
-                route_x = rect.right() + 24 + index * 12
-                path = QPainterPath(start)
-                path.lineTo(route_x, start.y())
-                path.lineTo(route_x, header_y + 92)
-                path.lineTo(end.x(), header_y + 92)
-                path.lineTo(end)
-                pen = QPen(color, 1.8, Qt.PenStyle.DashLine)
-                _add_path(scene, path, pen)
-                _draw_arrow(scene, QPointF(end.x(), header_y + 92), end, color)
+    routes = route_fixed_nodes(
+        node_rects, [spec[0] for spec in edge_specs]
+    )
+    edge_render = {spec[0].edge_id: spec[1:] for spec in edge_specs}
+    for edge_id, route in routes.items():
+        color, style, label_text = edge_render[edge_id]
+        pen = QPen(color, 2.0)
+        pen.setStyle(style)
+        _add_polyline_path(scene, route.points, pen)
+        if len(route.points) >= 2:
+            _draw_arrow(scene, route.points[-2], route.points[-1], color)
+        if label_text:
+            _add_edge_label(scene, label_text, route.label_position, color)
     return scene
 
-
-def _ordered_path_progress(path: list[Any], fired_productions: list[str]) -> int:
-    index = 0
-    for fired in fired_productions:
-        if index >= len(path):
+def _ordered_transition_progress(
+    path: list[StateTransitionAnalysis], fired_productions: list[str]
+) -> int:
+    """Count transitions reached; adapter edges complete with their trigger rule."""
+    fired_index = 0
+    transition_index = 0
+    while transition_index < len(path):
+        transition = path[transition_index]
+        if transition.kind == "adapter":
+            trigger = transition.trigger_production
+            if trigger and any(
+                name.casefold() == trigger.casefold()
+                for name in fired_productions[:fired_index]
+            ):
+                transition_index += 1
+                continue
             break
-        if str(fired).casefold() == str(path[index].name).casefold():
-            index += 1
-    return index
-
+        while fired_index < len(fired_productions):
+            fired = fired_productions[fired_index]
+            fired_index += 1
+            if (
+                transition.production_name
+                and fired.casefold() == transition.production_name.casefold()
+            ):
+                transition_index += 1
+                break
+        else:
+            break
+    return transition_index
 
 def _new_scene() -> QGraphicsScene:
     scene = QGraphicsScene()
@@ -729,9 +1037,11 @@ def _add_node(
     color: QColor,
     *,
     wrap_width: int = 38,
-) -> None:
+    border_color: QColor | None = None,
+    border_width: float = 1.5,
+) -> QGraphicsRectItem:
     node = QGraphicsRectItem(rect)
-    node.setPen(QPen(QColor("#dbe4f0"), 1.5))
+    node.setPen(QPen(border_color or QColor("#dbe4f0"), border_width))
     node.setBrush(QBrush(color))
     scene.addItem(node)
     text = QGraphicsTextItem(_wrap_label(label, wrap_width))
@@ -739,13 +1049,95 @@ def _add_node(
     text.setTextWidth(rect.width() - 18)
     text.setPos(rect.x() + 9, rect.y() + 8)
     scene.addItem(text)
+    return node
 
 
-def _add_path(scene: QGraphicsScene, path: QPainterPath, pen: QPen) -> None:
+def _add_route_bundle_markers(scene: QGraphicsScene, routes: list[Any]) -> None:
+    """Mark intentional shared trunks so merges and splits remain traceable."""
+    segment_routes: dict[tuple[float, float, float, float], set[str]] = defaultdict(set)
+    segment_points: dict[tuple[float, float, float, float], tuple[QPointF, QPointF]] = {}
+    for route in routes:
+        for first, second in zip(route.points, route.points[1:]):
+            a = (round(first.x(), 3), round(first.y(), 3))
+            b = (round(second.x(), 3), round(second.y(), 3))
+            key = (*a, *b) if a <= b else (*b, *a)
+            segment_routes[key].add(route.edge.edge_id)
+            segment_points[key] = (first, second)
+    marked: set[tuple[float, float]] = set()
+    for key, edge_ids in segment_routes.items():
+        if len(edge_ids) < 2:
+            continue
+        first, second = segment_points[key]
+        for point in (first, second):
+            point_key = (round(point.x(), 3), round(point.y(), 3))
+            if point_key in marked:
+                continue
+            marked.add(point_key)
+            marker = QGraphicsEllipseItem(point.x() - 4.5, point.y() - 4.5, 9.0, 9.0)
+            marker.setPen(QPen(QColor("#f8fafc"), 1.2))
+            marker.setBrush(QBrush(QColor("#334155")))
+            marker.setToolTip(
+                "Shared route bus: " + ", ".join(sorted(edge_ids))
+            )
+            scene.addItem(marker)
+
+
+def _add_polyline_path(
+    scene: QGraphicsScene, points: list[QPointF], pen: QPen
+) -> QGraphicsPathItem:
+    if not points:
+        return _add_path(scene, QPainterPath(), pen)
+    path = QPainterPath(points[0])
+    for point in points[1:]:
+        path.lineTo(point)
+    return _add_path(scene, path, pen)
+
+
+def _add_path(
+    scene: QGraphicsScene, path: QPainterPath, pen: QPen
+) -> QGraphicsPathItem:
     item = QGraphicsPathItem(path)
     item.setPen(pen)
     item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
     scene.addItem(item)
+    return item
+
+
+def _numeric_code(code: str) -> int:
+    try:
+        return int(code[1:])
+    except (TypeError, ValueError, IndexError):
+        return 10**9
+
+
+def _ordered_transitions_for_codes(
+    transitions: list[StateTransitionAnalysis],
+    geometry: Any,
+) -> list[StateTransitionAnalysis]:
+    """Return stable P/A numbering based on the rendered graph geometry.
+
+    Production and adapter codes are independent.  Within each family, source
+    nodes are ordered by rank and screen position, followed by target position
+    and the semantic transition label.  The result is deterministic and mirrors
+    how a reader scans the graph.
+    """
+    def key(transition: StateTransitionAnalysis) -> tuple[Any, ...]:
+        source = geometry.placements[transition.source_state_id]
+        target = geometry.placements[transition.target_state_id]
+        family = 0 if transition.kind == "production" else 1
+        return (
+            family,
+            source.rank,
+            round(source.rect.top(), 3),
+            round(source.rect.left(), 3),
+            target.rank,
+            round(target.rect.top(), 3),
+            round(target.rect.left(), 3),
+            transition.label.casefold(),
+            transition.transition_id,
+        )
+
+    return sorted(transitions, key=key)
 
 
 def _add_edge_label(
@@ -753,18 +1145,24 @@ def _add_edge_label(
     text: str,
     position: QPointF,
     color: QColor,
-) -> None:
+) -> QGraphicsSimpleTextItem:
     label = QGraphicsSimpleTextItem(text)
     label.setBrush(QBrush(color))
     label.setPos(position)
     bounds = label.boundingRect().adjusted(-6, -3, 6, 3)
     background = QGraphicsRectItem(
-        QRectF(position.x() + bounds.x(), position.y() + bounds.y(), bounds.width(), bounds.height())
+        QRectF(
+            position.x() + bounds.x(),
+            position.y() + bounds.y(),
+            bounds.width(),
+            bounds.height(),
+        )
     )
     background.setPen(QPen(QColor("#334155"), 0.8))
     background.setBrush(QBrush(LABEL_BACKGROUND))
     scene.addItem(background)
     scene.addItem(label)
+    return label
 
 
 def _draw_arrow(scene: QGraphicsScene, start: QPointF, end: QPointF, color: QColor) -> None:
