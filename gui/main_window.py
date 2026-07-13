@@ -60,7 +60,7 @@ class SimulationMainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self.human_input_controller)
-        self.setWindowTitle("ACT-R Multi-Agent Simulation")
+        self.setWindowTitle("ACT-R Multi-Agent Demo")
         icon_path = application_icon_path()
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -195,7 +195,7 @@ class SimulationMainWindow(QMainWindow):
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(16, 12, 16, 12)
 
-        title = QLabel("ACT-R Multi-Agent Simulation")
+        title = QLabel("ACT-R Multi-Agent Demo")
         title.setObjectName("appTitle")
         layout.addWidget(title)
         layout.addStretch(1)

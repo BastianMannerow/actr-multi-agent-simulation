@@ -110,7 +110,13 @@ class Simulation:
         self.game_environment = Environment(level_matrix)
         self.middleman.set_game_environment(self.game_environment)
 
+        # Create every pyactr simulation with the real initial matrix frame.
+        # This removes the old dummy stimulus and ensures that later
+        # EmptySchedule resets reuse a valid, current frame as well.
         for agent in self.agent_list:
+            agent.update_stimulus(publish=False)
+            agent.set_simulation()
+            agent.update_stimulus(publish=True)
             self.buffer_history.capture_agent(
                 agent, force=True, reason="initialization"
             )
@@ -182,7 +188,6 @@ class Simulation:
             agent.set_actr_agent(actr_agent)
             agent.set_actr_adapter(actr_adapter)
             agent.set_actr_construct(actr_construct)
-            agent.set_simulation()
 
     def move_human_agent(self, direction: str) -> bool:
         """Move the optional human agent independently of ACT-R timing."""
@@ -327,11 +332,13 @@ class Simulation:
             return None
 
         assert self.middleman is not None
-        for agent in list(self.agent_list):
-            agent.update_stimulus()
         pyactr_extension.fix_pyactr()
         self.agent_list.sort(key=lambda agent: agent.actr_time)
         agent = self.agent_list[0]
+        # The pyactr Environment is shared. Publish only the point of view of
+        # the agent that is about to step; otherwise the final agent updated in
+        # a loop would overwrite the frame consumed by the scheduled agent.
+        agent.update_stimulus(publish=True)
 
         try:
             with self.suppress_stdout():
@@ -380,6 +387,7 @@ class Simulation:
             AttributeError,
             IndexError,
             RuntimeError,
+            TypeError,
         ) as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             try:

@@ -1,4 +1,5 @@
 from simulation.world.entities import SpatialAgent
+from simulation.integrations import pyactr_extension
 
 class AgentConstruct(SpatialAgent):
     """
@@ -58,9 +59,10 @@ class AgentConstruct(SpatialAgent):
         self.print_agent_actions = False     # Controlled by Simulation to enable or silence logs.
 
         # --- Perceptual input placeholders ---
-        self.visual_stimuli = []             # Direct-access copy of visible objects; bypasses ACT-R VISUAL if needed.
-        self.triggers = [{'S': {'text': 'S', 'position': (1, 1)}}]
-        self.stimuli = ['S']                 # Initial dummy stimuli to bootstrap perception.
+        self.visual_stimuli = []             # Human-readable matrix around the agent.
+        self.visual_metadata = {}            # Rich metadata kept outside pyactr stimuli.
+        self.triggers = [set()]               # One trigger collection per visual frame.
+        self.stimuli = [{}]                   # One pyactr-safe visual frame.
 
     # ---------------------------
     # Initialization utilities
@@ -140,18 +142,22 @@ class AgentConstruct(SpatialAgent):
     # ---------------------------
     # Perception pipeline
     # ---------------------------
-    def update_stimulus(self):
-        """
-        Refresh the agent’s perceptual buffers from the environment via the Middleman.
+    def update_stimulus(self, *, publish: bool = True):
+        """Refresh this agent's live pyactr visual frame.
 
-        Synchronizes new stimuli (text and position) into the agent’s VISUAL buffer.
-        Also triggers GUI refresh to reflect perception updates.
+        The Middleman returns only pyactr-supported stimulus fields. Rich
+        matrix metadata remains available separately in ``visual_metadata``.
+        If a cognitive simulation already exists, the latest frame is
+        published immediately and automatic visual buffers are refreshed with
+        pyactr's own buffer/chunk APIs.
         """
-        if self.middleman.experiment_environment:
-            new_triggers, new_stimuli = self.middleman.get_agent_stimulus(self)
-            self.triggers = new_triggers
-            self.stimuli = new_stimuli
-            self.middleman.simulation.notify_gui()
+        if not self.middleman.experiment_environment:
+            return
+        new_triggers, new_stimuli = self.middleman.get_agent_stimulus(self)
+        self.triggers = new_triggers
+        self.stimuli = new_stimuli
+        if publish:
+            pyactr_extension.publish_visual_stimulus(self)
 
     # ---------------------------
     # ACT-R extensions and reset

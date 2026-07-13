@@ -154,6 +154,173 @@ def fix_pyactr() -> None:
     vision.VisualLocation.find = patched_find
 
 
+def sanitize_visual_frame(frame: Any) -> dict[str, dict[str, Any]]:
+    """Return a pyactr-safe visual frame.
+
+    pyactr converts every non-reserved stimulus key into a chunk slot. Only
+    ``text``, ``position`` and optional ``vis_delay`` are therefore accepted
+    here. This protects both visual-location and visual-buffer construction.
+    """
+    if not isinstance(frame, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_stimulus in frame.items():
+        if not isinstance(raw_stimulus, dict):
+            continue
+        text = raw_stimulus.get("text")
+        position = raw_stimulus.get("position")
+        try:
+            if text is None or position is None or len(position) != 2:
+                continue
+            x, y = float(position[0]), float(position[1])
+        except (TypeError, ValueError):
+            continue
+        stimulus: dict[str, Any] = {
+            "text": str(text),
+            "position": (x, y),
+        }
+        if raw_stimulus.get("vis_delay") is not None:
+            try:
+                stimulus["vis_delay"] = float(raw_stimulus["vis_delay"])
+            except (TypeError, ValueError):
+                pass
+        result[str(raw_key)] = stimulus
+    return result
+
+
+def publish_visual_stimulus(agent_construct: Any) -> dict[str, dict[str, Any]]:
+    """Publish the latest frame and refresh automatic pyactr visual buffers.
+
+    The environment is shared by the model's visual modules. The currently
+    scheduled agent publishes its own frame immediately before a cognitive
+    step. Explicit visual requests then read the updated environment, while
+    automatic visual-location/visual buffers are refreshed using pyactr's own
+    chunk constructors and buffer APIs.
+    """
+    stimuli = getattr(agent_construct, "stimuli", None)
+    raw_frame = stimuli[0] if isinstance(stimuli, list) and stimuli else stimuli
+    frame = sanitize_visual_frame(raw_frame)
+    environment = getattr(agent_construct, "actr_environment", None)
+    if environment is None:
+        return frame
+    # ``Environment.output`` prints every update when pyactr GUI mode is off.
+    # Direct assignment is equivalent for perception and keeps the application
+    # console clean; scheduled pyactr environment events still use output().
+    environment.stimulus = frame
+
+    simulation = getattr(agent_construct, "simulation", None)
+    buffers = getattr(simulation, "_Simulation__buffers", None)
+    if not isinstance(buffers, dict):
+        return frame
+
+    model = getattr(agent_construct, "actr_agent", None)
+    parameters = dict(getattr(model, "model_parameters", {}) or {})
+    values = list(frame.values())
+    current_time = float(getattr(agent_construct, "actr_time", 0.0))
+    buffers_changed = False
+
+    for buffer in buffers.values():
+        try:
+            if getattr(buffer, "state", None) == getattr(buffer, "_BUSY", object()):
+                continue
+
+            if isinstance(buffer, vision.VisualLocation):
+                if not bool(parameters.get("automatic_visual_search", True)):
+                    continue
+                new_chunk, found_stimulus = buffer.automatic_search(values)
+                current_chunk = next(iter(buffer), None) if buffer else None
+                if new_chunk is None:
+                    if buffer:
+                        buffer.clear(current_time)
+                        buffers_changed = True
+                elif current_chunk is None:
+                    buffer.add(new_chunk, found_stimulus, current_time)
+                    buffers_changed = True
+                elif str(current_chunk) != str(new_chunk):
+                    buffer.modify(new_chunk, found_stimulus)
+                    buffers_changed = True
+                buffer.state = buffer._FREE
+                continue
+
+            if isinstance(buffer, vision.Visual) and bool(
+                getattr(buffer, "attend_automatic", False)
+            ):
+                selected = _foveal_stimulus(buffer, values)
+                if selected is None:
+                    if buffer:
+                        buffer.clear(current_time)
+                        buffers_changed = True
+                    buffer.state = buffer._FREE
+                    buffer.autoattending = buffer._FREE
+                    continue
+                new_chunk, _encoding = buffer.automatic_buffering(
+                    selected,
+                    parameters,
+                )
+                current_chunk = next(iter(buffer), None) if buffer else None
+                if current_chunk is None:
+                    buffer.add(new_chunk, current_time)
+                    buffers_changed = True
+                elif str(current_chunk) != str(new_chunk):
+                    buffer.modify(new_chunk)
+                    buffers_changed = True
+                buffer.state = buffer._FREE
+                buffer.autoattending = buffer._FREE
+        except (ACTRError, AttributeError, KeyError, TypeError, ValueError):
+            # A malformed individual object must not invalidate the complete
+            # frame. Explicit production requests can still use the published
+            # safe environment stimulus.
+            continue
+
+    if buffers_changed:
+        activation = getattr(simulation, "_Simulation__proc_activate", None)
+        try:
+            if activation is not None and not activation.triggered:
+                activation.succeed()
+        except (AttributeError, RuntimeError):
+            pass
+    return frame
+
+
+def _foveal_stimulus(
+    visual_buffer: Any,
+    stimuli: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not stimuli:
+        return None
+    environment = visual_buffer.environment
+    try:
+        foveal_distance = utilities.calculate_distance(
+            1,
+            environment.size,
+            environment.simulated_screen_size,
+            environment.viewing_distance,
+        )
+        focus = tuple(visual_buffer.current_focus)
+        candidates = [
+            stimulus
+            for stimulus in stimuli
+            if abs(float(stimulus["position"][0]) - float(focus[0])) < foveal_distance
+            and abs(float(stimulus["position"][1]) - float(focus[1])) < foveal_distance
+        ]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        candidates = list(stimuli)
+        focus = (0.0, 0.0)
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda stimulus: (
+            float(stimulus["position"][0]) - float(focus[0])
+        ) ** 2
+        + (
+            float(stimulus["position"][1]) - float(focus[1])
+        ) ** 2,
+    )
+
+
+
+
 # ---------------------------------------------------------------------------
 # ACT-R event utilities
 # ---------------------------------------------------------------------------

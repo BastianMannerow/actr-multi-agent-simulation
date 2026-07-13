@@ -1,166 +1,146 @@
+"""Communication layer between ACT-R agents and the simple matrix world."""
+
+from __future__ import annotations
+
+from typing import Any
+
 from simulation.runtime.agent_construct import AgentConstruct
 from simulation.world.entities import SpatialAgent
 
 
 class Middleman:
-    """
-    Mediates bidirectional communication between agents and their environment.
+    """Translate matrix state into pyactr-safe perception and motor actions."""
 
-    Purpose
-    -------
-    - Translate cognitive outputs (motor commands) into environment actions.
-    - Convert environment states into visual stimuli accessible to agents.
-    - Maintain a clean separation between cognitive logic (agents) and spatial logic (environment).
-
-    Design
-    ------
-    - Created before the Environment instance; attached later via `set_game_environment()`.
-    - Stateless with respect to simulation progression; acts as a message-passing layer.
-    - Used by `Simulation` to unify ACT-R interaction with a matrix world.
-
-    Attributes
-    ----------
-    simulation : Simulation
-        The parent simulation orchestrator.
-    experiment_environment : Environment | None
-        The active environment containing the world matrix.
-    print_middleman : bool
-        Enables optional debug logging for inspection of agent-environment exchanges.
-    """
-
-    def __init__(self, simulation, print_middleman: bool):
+    def __init__(self, simulation: Any, print_middleman: bool):
         self.simulation = simulation
         self.experiment_environment = None
         self.print_middleman = print_middleman
 
-    # ---------------------------------------------------------------------
-    # Environment connection
-    # ---------------------------------------------------------------------
-    def set_game_environment(self, experiment_environment):
-        """
-        Attach the environment instance after its creation.
-
-        Parameters
-        ----------
-        experiment_environment : Environment
-            Active environment instance the agents interact with.
-        """
+    def set_game_environment(self, experiment_environment: Any) -> None:
         self.experiment_environment = experiment_environment
 
-    # ---------------------------------------------------------------------
-    # Agent → Environment: Motor interface
-    # ---------------------------------------------------------------------
-    def motor_input(self, key: str, current_agent: AgentConstruct):
-        """
-        Execute environment actions based on a symbolic key command.
+    def motor_input(self, key: str, current_agent: AgentConstruct) -> bool:
+        """Apply a W/A/S/D command to the simple matrix environment."""
+        if self.experiment_environment is None:
+            return False
+        movement = {
+            "W": self.experiment_environment.move_agent_top,
+            "A": self.experiment_environment.move_agent_left,
+            "S": self.experiment_environment.move_agent_bottom,
+            "D": self.experiment_environment.move_agent_right,
+        }.get(str(key).upper())
+        if movement is None:
+            return False
+        moved = bool(movement(current_agent))
+        if self.print_middleman:
+            print(
+                f"{current_agent.name}: motor {key} -> "
+                f"{'accepted' if moved else 'blocked'}"
+            )
+        return moved
 
-        Parameters
-        ----------
-        key : str
-            Command key (typically one of W/A/S/D).
-        current_agent : AgentConstruct
-            The currently active cognitive agent.
-        """
-        if key == "W":
-            self.experiment_environment.move_agent_top(current_agent)
-        elif key == "A":
-            self.experiment_environment.move_agent_left(current_agent)
-        elif key == "S":
-            self.experiment_environment.move_agent_bottom(current_agent)
-        elif key == "D":
-            self.experiment_environment.move_agent_right(current_agent)
-
-    # ---------------------------------------------------------------------
-    # Environment → Agent: Perception interface
-    # ---------------------------------------------------------------------
     def get_agent_stimulus(self, agent: AgentConstruct):
+        """Build the current visual frame for one ACT-R agent.
+
+        Only fields understood by pyactr are placed in the stimulus frame:
+        ``text``, ``position`` and optionally ``vis_delay``. Application data
+        such as class names and matrix/view coordinates is stored separately in
+        ``agent.visual_metadata`` and can therefore never become an invalid
+        pyactr chunk slot.
+
+        The position tuple follows pyactr's screen-coordinate convention
+        ``(x, y)``. For the matrix this means ``(column, row)``.
         """
-        Generate a visual stimulus representation for a specific agent.
+        environment = self.experiment_environment
+        if environment is None:
+            agent.visual_stimuli = []
+            agent.visual_metadata = {}
+            return [set()], [{}]
 
-        Purpose
-        -------
-        - Sample the environment grid around the agent based on its line of sight (LoS).
-        - Produce symbolic stimuli (letters) representing nearby agents or objects.
-        - Update the agent’s internal `visual_stimuli` buffer for cognitive access.
+        matrix = environment.level_matrix
+        position = environment.find_agent(agent)
+        if position is None or not matrix or not matrix[0]:
+            agent.visual_stimuli = []
+            agent.visual_metadata = {}
+            return [set()], [{}]
 
-        Parameters
-        ----------
-        agent : AgentConstruct
-            Agent requesting visual information.
-
-        Returns
-        -------
-        tuple[list[str], list[dict]] or (None, None)
-            *new_triggers* — all visible object symbols,
-            *stimuli* — a single-element list containing a dict mapping indices to
-            `{"text": symbol, "position": (row, col)}`.
-            Returns ``(None, None)`` if the agent is not found.
-        """
-        matrix = self.experiment_environment.level_matrix
-        position = self.experiment_environment.find_agent(agent)
-        if position is None:
-            return None, None
-        r, c = position
-
+        row, column = position
         agent_map = agent.get_agent_dictionary()
-        los = agent.los
-        rows, cols = len(matrix), len(matrix[0])
+        line_of_sight = int(agent.los)
+        rows, columns = len(matrix), len(matrix[0])
 
-        # Determine the visible area based on line of sight (LoS)
-        if los == 0 or los >= max(rows, cols):
-            # Full visibility over the entire matrix
-            x_los = cols
-            y_los = rows
-            off_x = c
-            off_y = r
+        if line_of_sight == 0 or line_of_sight >= max(rows, columns):
+            window_width, window_height = columns, rows
+            offset_x, offset_y = column, row
         else:
-            # Square window around the agent: Chebyshev radius = los
-            x_los = y_los = 2 * los + 1
-            off_x = off_y = los
+            window_width = window_height = 2 * line_of_sight + 1
+            offset_x = offset_y = line_of_sight
 
-        new_triggers = []
-        frame = {}
-        visual_stimuli = [["" for _ in range(x_los)] for _ in range(y_los)]
-        index = 0
+        trigger_symbols: set[str] = set()
+        frame: dict[str, dict[str, Any]] = {}
+        metadata: dict[str, dict[str, Any]] = {}
+        visible_matrix = [
+            ["-" for _ in range(window_width)]
+            for _ in range(window_height)
+        ]
 
-        # Scan through the visible window
-        for i in range(y_los):
-            for j in range(x_los):
-                mi = r - off_y + i
-                mj = c - off_x + j
-
-                # Out of bounds
-                if mi < 0 or mi >= rows or mj < 0 or mj >= cols:
-                    visual_stimuli[i][j] = "-"
+        for view_row in range(window_height):
+            for view_column in range(window_width):
+                matrix_row = row - offset_y + view_row
+                matrix_column = column - offset_x + view_column
+                if not (0 <= matrix_row < rows and 0 <= matrix_column < columns):
                     continue
 
-                cell = matrix[mi][mj]
+                cell = matrix[matrix_row][matrix_column]
                 if not cell:
-                    visual_stimuli[i][j] = "-"
                     continue
 
-                for element in cell:
-                    if isinstance(element, SpatialAgent):
-                        # Identify other agents using symbolic letter codes
-                        for sym, info in agent_map.items():
-                            if info["agent"] == element:
-                                new_triggers.append(sym)
-                                frame[index] = {"text": sym, "position": (mi, mj)}
-                                visual_stimuli[i][j] = sym
-                                index += 1
-                                break
+                symbols: list[str] = []
+                for object_index, element in enumerate(cell):
+                    symbol = self._symbol_for(element, agent_map)
+                    if symbol is None:
+                        continue
 
-                    # Extend here for additional object classes if needed,
-                    # e.g. Food, Wall, RewardZone, etc.
-                    # Example: Extend here for additional object classes
-                    # e.g., Food, Wall, RewardZone, etc.
-                    # elif isinstance(element, Food):
-                    #     sym = 'X'
-                    #     new_triggers.append(sym)
-                    #     frame[index] = {"text": sym, "position": (mi, mj)}
-                    #     visual_stimuli[i][j] = sym
-                    #     index += 1
+                    symbols.append(symbol)
+                    trigger_symbols.add(symbol)
+                    stimulus_id = (
+                        f"r{matrix_row}_c{matrix_column}_i{object_index}_"
+                        f"{type(element).__name__}"
+                    )
+                    frame[stimulus_id] = {
+                        "text": symbol,
+                        "position": (matrix_column, matrix_row),
+                    }
+                    metadata[stimulus_id] = {
+                        "entity_class": type(element).__name__,
+                        "display_name": str(
+                            getattr(element, "name", type(element).__name__)
+                        ),
+                        "matrix_position": (matrix_row, matrix_column),
+                        "view_position": (view_row, view_column),
+                        "is_human_controlled": bool(
+                            getattr(element, "is_human_controlled", False)
+                        ),
+                    }
 
-        agent.visual_stimuli = visual_stimuli
-        stimuli = [frame]
-        return new_triggers, stimuli
+                visible_matrix[view_row][view_column] = "".join(symbols) or "-"
+
+        agent.visual_stimuli = visible_matrix
+        agent.visual_metadata = metadata
+
+        # pyactr expects exactly one trigger collection for one visual frame.
+        # A list of strings would duplicate the same frame once per symbol.
+        return [trigger_symbols], [frame]
+
+    @staticmethod
+    def _symbol_for(
+        element: Any,
+        agent_map: dict[str, dict[str, Any]],
+    ) -> str | None:
+        if isinstance(element, SpatialAgent):
+            for candidate, info in agent_map.items():
+                if info.get("agent") is element:
+                    return str(candidate)
+            return str(getattr(element, "symbol", "A"))
+        symbol = getattr(element, "symbol", None)
+        return str(symbol) if symbol is not None else None
