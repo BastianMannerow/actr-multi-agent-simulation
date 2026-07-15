@@ -54,7 +54,8 @@ class AgentConstruct(SpatialAgent):
 
         # --- Metadata and runtime identifiers ---
         self.name_number = name_number       # Public GUI identifier, used to bind visuals to agents.
-        self.actr_time = 0.0                 # Local cognitive time, synced with simulation clock.
+        self.actr_time = 0.0                 # Absolute local pyactr/SimPy time.
+        self.no_increase_count = 0           # Guard for zero-time event loops.
         self.middleman = middleman
         self.los = los
         self.print_agent_actions = False     # Controlled by Simulation to enable or silence logs.
@@ -120,6 +121,7 @@ class AgentConstruct(SpatialAgent):
                     "times": 0.1,
                 }
             )
+        simulation_kwargs["initial_time"] = float(self.actr_time)
         self.simulation = self.actr_agent.simulation(**simulation_kwargs)
 
     # ---------------------------
@@ -194,7 +196,7 @@ class AgentConstruct(SpatialAgent):
         -------
         - Reinstantiates the cognitive simulation loop.
         - Preserves agent identity and adapter bindings.
-        - Resets internal timing and visual stimuli buffers.
+        - Preserves the absolute ACT-R timeline and refreshes visual buffers.
         """
         if not default_goal:
             default_goal = self.actr_construct.initial_goal
@@ -215,7 +217,12 @@ class AgentConstruct(SpatialAgent):
                     "times": 0.1,
                 }
             )
+        # A rebuilt pyactr simulation must continue on the existing absolute
+        # model timeline.  Starting again at zero would make the clock move
+        # backwards and corrupt multi-agent ordering and history exports.
+        simulation_kwargs["initial_time"] = float(self.actr_time)
         self.simulation = self.actr_agent.simulation(**simulation_kwargs)
+        self.no_increase_count = 0
 
     def handle_empty_schedule(self):
         """

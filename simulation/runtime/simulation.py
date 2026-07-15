@@ -27,6 +27,10 @@ from simulation.config.settings_store import SimulationSettingsStore
 from simulation.export.history_export import SimulationHistoryExporter
 
 
+_TIME_EPSILON = 1e-9
+_MAX_CONSECUTIVE_ZERO_TIME_EVENTS = 1000
+
+
 class Simulation:
     """Build agents and coordinate pausable Step, Automatic, and Jump modes."""
 
@@ -38,7 +42,10 @@ class Simulation:
         self.history_exporter = SimulationHistoryExporter()
         self.settings_store: SimulationSettingsStore | None = None
 
+        # pyactr Event.time values are absolute model times.  Keep the
+        # wrapper clock on exactly the same absolute time base.
         self.global_sim_time = 0.0
+        self._last_global_time_delta = 0.0
         self.agent_list: list[AgentConstruct] = []
         self.human_agent: HumanAgent | None = None
         self.actr_environment: Any | None = None
@@ -95,6 +102,7 @@ class Simulation:
         self._mirror_config_attributes()
         self.execution_mode = config.execution_mode
         self.global_sim_time = 0.0
+        self._last_global_time_delta = 0.0
         self.agent_list.clear()
         self.human_agent = None
         self.interceptor.clear()
@@ -314,15 +322,14 @@ class Simulation:
         ):
             return
 
-        self.agent_list.sort(key=lambda agent: agent.actr_time)
-        next_agent = self.agent_list[0]
-        delay = max(
-            0.0,
-            float(next_agent.actr_time) - float(self.global_sim_time),
-        )
         if float(self.speed_factor) == -1.0:
             self._auto_timer.start(0)
             return
+        # The previous visible event already established how far the shared
+        # model clock advanced.  Delaying by that delta avoids treating an
+        # absolute timestamp as a duration and lets lagging agents catch up
+        # without adding artificial wall-clock time.
+        delay = max(0.0, float(self._last_global_time_delta))
         factor = 100.0 / float(self.speed_factor)
         milliseconds = max(1, round(delay * factor * 1000))
         self._auto_timer.start(milliseconds)
@@ -345,8 +352,13 @@ class Simulation:
 
         assert self.middleman is not None
         pyactr_extension.fix_pyactr()
-        self.agent_list.sort(key=lambda agent: agent.actr_time)
+        # Each agent owns an independent pyactr clock.  Advancing the agent
+        # with the lowest current model time keeps agents approximately in
+        # lockstep without pre-executing events from another world state.
+        self.agent_list.sort(key=lambda candidate: candidate.actr_time)
         agent = self.agent_list[0]
+        previous_agent_time = float(agent.actr_time)
+        previous_global_time = float(self.global_sim_time)
         # The pyactr Environment is shared. Publish only the frame of the agent
         # that is about to step, so its visual requests and automatic buffers
         # cannot accidentally consume another agent's point of view.
@@ -361,15 +373,39 @@ class Simulation:
                     f"{agent.name} did not produce an ACT-R event."
                 )
 
-            event_time = float(getattr(event, "time", 0.0))
-            if event_time > 0:
+            # ``Event.time`` and ``Simulation.show_time()`` are absolute
+            # pyactr/SimPy timestamps.  The old runtime added that absolute
+            # value to ``actr_time`` on every event, producing quadratic time
+            # inflation.  show_time() is authoritative; Event.time is retained
+            # as a compatibility fallback.
+            try:
+                event_time = float(agent.simulation.show_time())
+            except (AttributeError, TypeError, ValueError):
+                event_time = float(getattr(event, "time", previous_agent_time))
+
+            if event_time < previous_agent_time - _TIME_EPSILON:
+                raise RuntimeError(
+                    f"{agent.name} ACT-R time moved backwards from "
+                    f"{previous_agent_time:g} to {event_time:g}."
+                )
+
+            agent_delta = max(0.0, event_time - previous_agent_time)
+            if agent_delta > _TIME_EPSILON:
                 agent.no_increase_count = 0
             else:
                 agent.no_increase_count = (
                     getattr(agent, "no_increase_count", 0) + 1
                 )
 
-            if agent.no_increase_count >= 10:
+            # Several normal pyactr events may occur at the same timestamp.
+            # Keep a high guard against a genuinely non-advancing event loop
+            # without terminating valid conflict-resolution/buffer clusters.
+            if agent.no_increase_count >= _MAX_CONSECUTIVE_ZERO_TIME_EVENTS:
+                self.last_error = (
+                    f"{agent.name} produced "
+                    f"{_MAX_CONSECUTIVE_ZERO_TIME_EVENTS} consecutive "
+                    "events without advancing ACT-R time."
+                )
                 self.agent_list.remove(agent)
                 if self.game_environment is not None:
                     self.game_environment.remove_agent_from_game(agent)
@@ -378,8 +414,17 @@ class Simulation:
                 self.notify_gui()
                 return None
 
-            agent.actr_time += event_time
-            self.global_sim_time = agent.actr_time
+            agent.actr_time = event_time
+            # Agents run on independent absolute pyactr clocks.  The shared
+            # elapsed model time is the furthest local clock reached, not the
+            # sum of event timestamps.
+            self.global_sim_time = max(
+                [float(item.actr_time) for item in self.agent_list],
+                default=event_time,
+            )
+            self._last_global_time_delta = max(
+                0.0, self.global_sim_time - previous_global_time
+            )
             agent.actr_extension()
             if agent.print_agent_actions:
                 print(f"{agent.name}, {agent.actr_time}, {event}")
