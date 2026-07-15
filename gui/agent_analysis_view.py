@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from threading import RLock
+from typing import Any, Callable
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -12,7 +13,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTabWidget,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -24,6 +24,12 @@ from gui.analysis_graphs import (
     build_interaction_scene,
     build_state_transition_scene,
 )
+from gui.transition_detail_dialog import TransitionDetailDialog
+from gui.llm_export import (
+    declarative_memory_payload,
+    interaction_payload,
+    state_graph_payload,
+)
 from simulation.discovery.agent_discovery import AgentDiscovery
 from simulation.inspection.source_analysis import (
     AgentSourceAnalyzer,
@@ -32,16 +38,32 @@ from simulation.inspection.source_analysis import (
 
 
 class AgentAnalysisView(QFrame):
-    """Visualize production flow, buffer access, and declarative memory."""
+    """Visualize production flow, buffer access, and declarative memory.
 
-    def __init__(self, simulation: Any, parent=None) -> None:
+    All source analysis, layout, routing, and scene construction is delegated to
+    the shared background task manager. Switching agent or tab immediately
+    invalidates the previous visual result instead of blocking the GUI thread.
+    """
+
+    def __init__(
+        self,
+        simulation: Any,
+        parent=None,
+        *,
+        task_manager=None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("panel")
         self.simulation = simulation
+        self.task_manager = task_manager
         self.discovery = AgentDiscovery()
         self.analyzer = AgentSourceAnalyzer()
         self._analysis_cache: dict[str, AgentStaticAnalysis] = {}
-        self._rendered_type: str | None = None
+        self._cache_lock = RLock()
+        self._rendered_tabs: set[tuple[str, str]] = set()
+        self._render_generation = 0
+        self._active_task_id: str | None = None
+        self._discovered_infos = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 14, 14, 14)
@@ -66,8 +88,11 @@ class AgentAnalysisView(QFrame):
         self.tabs.addTab(self._build_state_graph_tab(), "State Graph")
         self.tabs.addTab(self._build_interaction_tab(), "Buffer Interactions")
         self.tabs.addTab(
-            self._build_declarative_memory_tab(),
-            "Declarative Memory",
+            self._build_declarative_memory_tab(), "Declarative Memory"
+        )
+        self.tabs.currentChanged.connect(self._tab_changed)
+        self.state_graph_view.set_item_activation_handler(
+            self._open_transition_explanation
         )
         details_layout.addWidget(self.tabs, 1)
 
@@ -87,9 +112,18 @@ class AgentAnalysisView(QFrame):
         )
 
     def analysis_for_type(self, agent_type: str) -> AgentStaticAnalysis | None:
-        cached = self._analysis_cache.get(agent_type)
+        """Synchronous API retained for Production Jump validation."""
+        with self._cache_lock:
+            cached = self._analysis_cache.get(agent_type)
         if cached is not None:
             return cached
+        analysis = self._analyze_type(agent_type)
+        if analysis is not None:
+            with self._cache_lock:
+                self._analysis_cache[agent_type] = analysis
+        return analysis
+
+    def _analyze_type(self, agent_type: str) -> AgentStaticAnalysis | None:
         info = next(
             (
                 item
@@ -100,116 +134,74 @@ class AgentAnalysisView(QFrame):
         )
         if info is None:
             return None
-        analysis = self.analyzer.analyze(info)
-        self._analysis_cache[agent_type] = analysis
-        return analysis
+        return self.analyzer.analyze(info)
 
-    def _build_state_graph_tab(self) -> QWidget:
+    def _build_graph_page(
+        self,
+        *,
+        prefix: str,
+    ) -> tuple[QWidget, ZoomableGraphicsView]:
         page = QWidget(self)
         layout = QVBoxLayout(page)
         toolbar = QHBoxLayout()
-        self.state_graph_png = QPushButton("Export PNG")
-        self.state_graph_svg = QPushButton("Export SVG")
-        self.state_graph_fit = QPushButton("Fit View")
-        toolbar.addWidget(self.state_graph_png)
-        toolbar.addWidget(self.state_graph_svg)
-        toolbar.addWidget(self.state_graph_fit)
+        png = QPushButton("Export PNG")
+        svg = QPushButton("Export SVG")
+        llm = QPushButton("Export for LLM")
+        fit = QPushButton("Fit View")
+        toolbar.addWidget(png)
+        toolbar.addWidget(svg)
+        toolbar.addWidget(llm)
+        toolbar.addWidget(fit)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
-        self.state_graph_view = ZoomableGraphicsView(page)
-        self.state_graph_png.clicked.connect(
-            lambda: self.state_graph_view.export_dialog("png")
+        view = ZoomableGraphicsView(page)
+        png.clicked.connect(lambda: view.export_dialog("png"))
+        svg.clicked.connect(lambda: view.export_dialog("svg"))
+        llm.clicked.connect(view.export_for_llm_dialog)
+        fit.clicked.connect(view.reset_zoom)
+        layout.addWidget(view, 1)
+        setattr(self, f"{prefix}_png", png)
+        setattr(self, f"{prefix}_svg", svg)
+        setattr(self, f"{prefix}_llm", llm)
+        setattr(self, f"{prefix}_fit", fit)
+        return page, view
+
+    def _build_state_graph_tab(self) -> QWidget:
+        page, self.state_graph_view = self._build_graph_page(
+            prefix="state_graph"
         )
-        self.state_graph_svg.clicked.connect(
-            lambda: self.state_graph_view.export_dialog("svg")
-        )
-        self.state_graph_fit.clicked.connect(
-            self.state_graph_view.reset_zoom
-        )
-        self.state_findings = QTextEdit(page)
-        self.state_findings.setReadOnly(True)
-        self.state_findings.setMaximumHeight(135)
-        layout.addWidget(self.state_graph_view, 1)
-        layout.addWidget(self.state_findings)
         return page
 
     def _build_interaction_tab(self) -> QWidget:
         page = QWidget(self)
         layout = QVBoxLayout(page)
-        interaction_tabs = QTabWidget(page)
+        self.interaction_tabs = QTabWidget(page)
 
-        production_page = QWidget(page)
-        production_layout = QVBoxLayout(production_page)
-        production_toolbar = QHBoxLayout()
-        self.production_png = QPushButton("Export PNG")
-        self.production_svg = QPushButton("Export SVG")
-        production_toolbar.addWidget(self.production_png)
-        production_toolbar.addWidget(self.production_svg)
-        production_toolbar.addStretch(1)
-        production_layout.addLayout(production_toolbar)
-        self.production_graph_view = ZoomableGraphicsView(page)
-        self.production_png.clicked.connect(
-            lambda: self.production_graph_view.export_dialog("png")
+        production_page, self.production_graph_view = self._build_graph_page(
+            prefix="production"
         )
-        self.production_svg.clicked.connect(
-            lambda: self.production_graph_view.export_dialog("svg")
-        )
-        production_layout.addWidget(self.production_graph_view, 1)
-        interaction_tabs.addTab(
-            production_page,
-            "Productions → Buffers",
+        self.interaction_tabs.addTab(
+            production_page, "Productions → Buffers"
         )
 
-        adapter_page = QWidget(page)
-        adapter_layout = QVBoxLayout(adapter_page)
-        adapter_toolbar = QHBoxLayout()
-        self.adapter_png = QPushButton("Export PNG")
-        self.adapter_svg = QPushButton("Export SVG")
-        adapter_toolbar.addWidget(self.adapter_png)
-        adapter_toolbar.addWidget(self.adapter_svg)
-        adapter_toolbar.addStretch(1)
-        adapter_layout.addLayout(adapter_toolbar)
-        self.adapter_graph_view = ZoomableGraphicsView(page)
-        self.adapter_png.clicked.connect(
-            lambda: self.adapter_graph_view.export_dialog("png")
+        adapter_page, self.adapter_graph_view = self._build_graph_page(
+            prefix="adapter"
         )
-        self.adapter_svg.clicked.connect(
-            lambda: self.adapter_graph_view.export_dialog("svg")
+        self.interaction_tabs.addTab(
+            adapter_page, "Adapter Methods → Buffers"
         )
-        adapter_layout.addWidget(self.adapter_graph_view, 1)
-        interaction_tabs.addTab(
-            adapter_page,
-            "Adapter Methods → Buffers",
-        )
-
-        layout.addWidget(interaction_tabs, 1)
+        self.interaction_tabs.currentChanged.connect(self._tab_changed)
+        layout.addWidget(self.interaction_tabs, 1)
         return page
 
     def _build_declarative_memory_tab(self) -> QWidget:
-        page = QWidget(self)
-        layout = QVBoxLayout(page)
-        toolbar = QHBoxLayout()
-        self.memory_png = QPushButton("Export PNG")
-        self.memory_svg = QPushButton("Export SVG")
-        self.memory_fit = QPushButton("Fit View")
-        toolbar.addWidget(self.memory_png)
-        toolbar.addWidget(self.memory_svg)
-        toolbar.addWidget(self.memory_fit)
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
-        self.memory_graph_view = ZoomableGraphicsView(page)
-        self.memory_png.clicked.connect(
-            lambda: self.memory_graph_view.export_dialog("png")
-        )
-        self.memory_svg.clicked.connect(
-            lambda: self.memory_graph_view.export_dialog("svg")
-        )
-        self.memory_fit.clicked.connect(self.memory_graph_view.reset_zoom)
-        layout.addWidget(self.memory_graph_view, 1)
+        page, self.memory_graph_view = self._build_graph_page(prefix="memory")
         return page
 
-    def refresh(self) -> None:
-        infos = self.discovery.discover()
+    def refresh(self, *, force: bool = False) -> None:
+        if self._discovered_infos is None or force:
+            self._discovered_infos = self.discovery.discover()
+        infos = self._discovered_infos
         selected = self.agent_tree.current_selection()
         self.agent_tree.set_agents(
             list(getattr(self.simulation, "agent_list", [])),
@@ -224,78 +216,211 @@ class AgentAnalysisView(QFrame):
                 if item is not None:
                     self.agent_tree.setCurrentItem(item)
                     break
-        self._render_current_selection()
+        self._schedule_current_tab(force=force)
 
     def _selection_changed(
         self, selection: AgentTreeSelection | None
     ) -> None:
-        if selection is None:
-            return
-        self._render_current_selection(force=True)
+        if selection is not None:
+            self._schedule_current_tab(force=True)
 
-    def _render_current_selection(self, *, force: bool = False) -> None:
+    def _tab_changed(self, _index: int) -> None:
+        self._schedule_current_tab(force=False)
+
+    def _current_view_key(self) -> str:
+        index = self.tabs.currentIndex()
+        if index == 0:
+            return "state"
+        if index == 1:
+            return (
+                "production-interactions"
+                if self.interaction_tabs.currentIndex() == 0
+                else "adapter-interactions"
+            )
+        return "declarative-memory"
+
+    def _schedule_current_tab(self, *, force: bool) -> None:
+        self._render_generation += 1
+        generation = self._render_generation
+
+        def render() -> None:
+            if generation == self._render_generation:
+                self._render_current_selection(
+                    force=force, generation=generation
+                )
+
+        # The selected tab paints before any heavy task is queued.
+        QTimer.singleShot(0, render)
+
+    def _render_current_selection(
+        self,
+        *,
+        force: bool = False,
+        generation: int,
+    ) -> None:
         selection = self.agent_tree.current_selection()
         if selection is None:
             return
-        if not force and self._rendered_type == selection.agent_type:
+        view_key = self._current_view_key()
+        cache_key = (selection.agent_type, view_key)
+        if not force and cache_key in self._rendered_tabs:
             return
-        analysis = self.analysis_for_type(selection.agent_type)
-        if analysis is None:
+        agent_type = selection.agent_type
+        task_id = f"agent-analysis:{agent_type}:{view_key}"
+        title = self._task_title(agent_type, view_key)
+        if (
+            self.task_manager is not None
+            and self._active_task_id is not None
+            and self._active_task_id != task_id
+        ):
+            self.task_manager.invalidate(self._active_task_id)
+        self._active_task_id = task_id
+        if (
+            self.task_manager is not None
+            and self.task_manager.is_running(task_id)
+        ):
             return
-        self._render_state_graph(analysis)
-        self._render_interactions(analysis)
-        self._render_declarative_memory(analysis)
-        self._rendered_type = selection.agent_type
+        self._show_loading_placeholder(view_key, title)
 
-    def _render_state_graph(self, analysis: AgentStaticAnalysis) -> None:
-        self.state_graph_view.setScene(build_state_transition_scene(analysis))
-        self.state_graph_view.reset_zoom()
-        findings = [
-            f"Initial control state: {analysis.states.get(analysis.initial_state_id).label if analysis.states.get(analysis.initial_state_id) else analysis.initial_state_label}",
-            f"Expanded productions: {len(analysis.productions)}",
-            f"Reachable productions: {sum(1 for item in analysis.productions if item.reachable)}",
-            "Unreachable productions: "
-            + (
-                ", ".join(analysis.unreachable_productions)
-                if analysis.unreachable_productions
-                else "none"
-            ),
-            "Dead-end states: "
-            + (", ".join(analysis.dead_end_states) if analysis.dead_end_states else "none"),
-            "Terminal states: "
-            + (", ".join(analysis.terminal_states) if analysis.terminal_states else "none"),
-            f"States participating in loops: {len(analysis.loop_states)}",
-        ]
-        if analysis.analysis_warnings:
-            findings.extend(["", *analysis.analysis_warnings])
-        self.state_findings.setPlainText("\n".join(findings))
-
-    def _render_interactions(self, analysis: AgentStaticAnalysis) -> None:
-        self.production_graph_view.setScene(
-            build_interaction_scene(
-                "Which productions read or overwrite which buffers",
-                analysis.production_interactions,
-            )
-        )
-        self.production_graph_view.reset_zoom()
-        self.adapter_graph_view.setScene(
-            build_interaction_scene(
-                "Which adapter handlers read or overwrite which buffers",
-                analysis.adapter_interactions,
-            )
-        )
-        self.adapter_graph_view.reset_zoom()
-
-    def _render_declarative_memory(
-        self, analysis: AgentStaticAnalysis
-    ) -> None:
-        self.memory_graph_view.setScene(
-            build_declarative_memory_scene(
-                analysis.declarative_memory,
-                title=(
-                    f"Declarative Memory from Agent and Adapter Code — "
+        def job(progress):
+            progress(5, f"Analysing {agent_type}")
+            with self._cache_lock:
+                analysis = self._analysis_cache.get(agent_type)
+            if analysis is None:
+                analysis = self._analyze_type(agent_type)
+                if analysis is None:
+                    raise RuntimeError(f"Agent type '{agent_type}' was not found")
+                with self._cache_lock:
+                    self._analysis_cache[agent_type] = analysis
+            progress(28, "Preparing graph data")
+            if view_key == "state":
+                scene = build_state_transition_scene(analysis)
+                payload = state_graph_payload(
+                    analysis,
+                    transition_codes=getattr(scene, "_transition_codes", None),
+                )
+            elif view_key == "production-interactions":
+                title_text = "Which productions read or overwrite which buffers"
+                scene = build_interaction_scene(
+                    title_text, analysis.production_interactions
+                )
+                payload = interaction_payload(
+                    title_text, analysis.production_interactions
+                )
+            elif view_key == "adapter-interactions":
+                title_text = "Which adapter handlers read or overwrite which buffers"
+                scene = build_interaction_scene(
+                    title_text, analysis.adapter_interactions
+                )
+                payload = interaction_payload(
+                    title_text, analysis.adapter_interactions
+                )
+            else:
+                title_text = (
+                    "Declarative Memory from Agent and Adapter Code — "
                     f"{analysis.agent_type}"
-                ),
+                )
+                scene = build_declarative_memory_scene(
+                    analysis.declarative_memory, title=title_text
+                )
+                payload = declarative_memory_payload(
+                    analysis.declarative_memory, title=title_text
+                )
+            progress(92, "Finalizing scene")
+            return {
+                "analysis": analysis,
+                "scene": scene,
+                "payload": payload,
+                "view_key": view_key,
+                "agent_type": agent_type,
+            }
+
+        def apply(result: dict[str, Any]) -> None:
+            current = self.agent_tree.current_selection()
+            if (
+                generation != self._render_generation
+                or current is None
+                or current.agent_type != result["agent_type"]
+                or self._current_view_key() != result["view_key"]
+            ):
+                return
+            analysis = result["analysis"]
+            view = self._view_for_key(view_key)
+            view.setScene(result["scene"])
+            view.set_llm_export_data(
+                result["payload"],
+                default_name=f"{agent_type}_{view_key}",
             )
+            view.reset_zoom()
+            self._rendered_tabs.add(cache_key)
+
+        if self.task_manager is None:
+            try:
+                apply(job(lambda _value, _stage=None: None))
+            except Exception as exc:
+                self._show_render_error(view_key, f"{type(exc).__name__}: {exc}")
+        else:
+            self.task_manager.submit(
+                task_id,
+                title,
+                job,
+                apply,
+                on_error=lambda message: self._show_render_error(view_key, message),
+            )
+
+    def _open_transition_explanation(self, payload: dict[str, Any]) -> None:
+        if payload.get("payload_type") not in {
+            "state_transition_bundle",
+            "state_transition_explanation",
+        }:
+            return
+        dialog = TransitionDetailDialog(payload, self)
+        dialog.exec()
+
+    def _show_render_error(self, view_key: str, message: str) -> None:
+        view = self._view_for_key(view_key)
+        from PyQt6.QtGui import QBrush, QColor
+        from PyQt6.QtWidgets import QGraphicsScene, QGraphicsTextItem
+
+        scene = QGraphicsScene()
+        scene.setBackgroundBrush(QBrush(QColor("#0f172a")))
+        item = QGraphicsTextItem(
+            "The graph could not be generated.\n\n" + str(message)
         )
-        self.memory_graph_view.reset_zoom()
+        item.setDefaultTextColor(QColor("#fecaca"))
+        item.setTextWidth(900.0)
+        item.setPos(30.0, 30.0)
+        scene.addItem(item)
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-24, -24, 24, 24))
+        view.setScene(scene)
+
+    def _view_for_key(self, view_key: str) -> ZoomableGraphicsView:
+        return {
+            "state": self.state_graph_view,
+            "production-interactions": self.production_graph_view,
+            "adapter-interactions": self.adapter_graph_view,
+            "declarative-memory": self.memory_graph_view,
+        }[view_key]
+
+    def _show_loading_placeholder(self, view_key: str, title: str) -> None:
+        view = self._view_for_key(view_key)
+        from PyQt6.QtGui import QBrush, QColor
+        from PyQt6.QtWidgets import QGraphicsScene, QGraphicsTextItem
+
+        scene = QGraphicsScene()
+        scene.setBackgroundBrush(QBrush(QColor("#0f172a")))
+        item = QGraphicsTextItem(f"{title} is loading in the background…")
+        item.setDefaultTextColor(QColor("#cbd5e1"))
+        item.setPos(30, 30)
+        scene.addItem(item)
+        view.setScene(scene)
+
+    @staticmethod
+    def _task_title(agent_type: str, view_key: str) -> str:
+        names = {
+            "state": "State Graph",
+            "production-interactions": "Production Buffer Matrix",
+            "adapter-interactions": "Adapter Buffer Matrix",
+            "declarative-memory": "Declarative Memory Graph",
+        }
+        return f"{names[view_key]} · {agent_type}"

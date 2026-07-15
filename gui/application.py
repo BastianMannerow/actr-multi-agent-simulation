@@ -20,7 +20,7 @@ def _configure_windows_taskbar_identity() -> None:
         import ctypes
 
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "ACTR.MultiAgentSimulation"
+            "ACTR.DemoSimulation"
         )
     except Exception:
         pass
@@ -37,7 +37,7 @@ def create_application(argv: Sequence[str] | None = None) -> QApplication:
 
     _configure_windows_taskbar_identity()
     app = QApplication(list(argv) if argv is not None else sys.argv)
-    app.setApplicationName("ACT-R Multi-Agent Demo")
+    app.setApplicationName("ACT-R Demo Simulation")
     app.setOrganizationName("ACT-R Simulation Framework")
     icon_path = application_icon_path()
     if icon_path.exists():

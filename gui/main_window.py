@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QStringListModel, Qt
+from PyQt6.QtCore import QTimer, QStringListModel, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from gui.agent_analysis_view import AgentAnalysisView
+from gui.background_tasks import BackgroundTaskManager, TaskProgressWidget
 from gui.environment_view import EnvironmentView
 from gui.human_input_controller import HumanInputController
 from gui.jump_progress_dialog import JumpProgressDialog
@@ -40,7 +41,11 @@ from simulation.config.models import SPEED_PRESETS, SimulationConfig
 
 
 class SimulationMainWindow(QMainWindow):
-    """Single-window PyQt6 UI for simulation control and explainability."""
+    """Single-window UI with coalesced, visibility-aware runtime refreshes."""
+
+    refresh_requested = pyqtSignal()
+    AUTOMATIC_REFRESH_INTERVAL_MS = 50
+    IDLE_REFRESH_INTERVAL_MS = 0
 
     def __init__(self, tracer: Any, simulation: Any, parent=None) -> None:
         super().__init__(parent)
@@ -52,6 +57,10 @@ class SimulationMainWindow(QMainWindow):
             (),
         )
         self.jump_dialog: JumpProgressDialog | None = None
+        self._refresh_pending = False
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._perform_scheduled_refresh)
         self.human_input_controller = HumanInputController(
             self.simulation,
             enabled_predicate=self._human_controls_active,
@@ -60,7 +69,8 @@ class SimulationMainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self.human_input_controller)
-        self.setWindowTitle("ACT-R Multi-Agent Demo")
+        self.setWindowTitle("ACT-R Demo Simulation")
+        self.refresh_requested.connect(self.request_refresh)
         icon_path = application_icon_path()
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -72,6 +82,15 @@ class SimulationMainWindow(QMainWindow):
         root_layout.setContentsMargins(12, 12, 12, 8)
         root_layout.setSpacing(10)
         self.setCentralWidget(root)
+
+        self.background_task_progress = TaskProgressWidget(self)
+        self.statusBar().addWidget(self.background_task_progress, 0)
+        self.background_tasks = BackgroundTaskManager(
+            self.background_task_progress, self
+        )
+        self.background_tasks.task_failed.connect(
+            lambda message: self.statusBar().showMessage(message, 8000)
+        )
 
         root_layout.addWidget(self._build_header())
         root_layout.addWidget(self._build_toolbar())
@@ -87,6 +106,7 @@ class SimulationMainWindow(QMainWindow):
         self.analysis_view = AgentAnalysisView(
             self.simulation,
             self.content_stack,
+            task_manager=self.background_tasks,
         )
         self.content_stack.addWidget(self.analysis_view)
         self.multi_run_view = MultiSimulationRunView(
@@ -95,6 +115,8 @@ class SimulationMainWindow(QMainWindow):
         )
         self.multi_run_view.set_config_provider(self._collect_current_config)
         self.content_stack.addWidget(self.multi_run_view)
+        self.content_stack.currentChanged.connect(self._visible_view_changed)
+        self.left_tabs.currentChanged.connect(self._visible_view_changed)
         root_layout.addWidget(self.content_stack, 1)
         root_layout.addWidget(self._build_bottom_navigation())
 
@@ -181,6 +203,7 @@ class SimulationMainWindow(QMainWindow):
             self.tracer,
             self.simulation,
             splitter,
+            task_manager=self.background_tasks,
         )
         splitter.addWidget(self.left_tabs)
         splitter.addWidget(self.step_log_view)
@@ -195,7 +218,7 @@ class SimulationMainWindow(QMainWindow):
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(16, 12, 16, 12)
 
-        title = QLabel("ACT-R Multi-Agent Demo")
+        title = QLabel("ACT-R Demo Simulation")
         title.setObjectName("appTitle")
         layout.addWidget(title)
         layout.addStretch(1)
@@ -334,11 +357,52 @@ class SimulationMainWindow(QMainWindow):
         self.environment_view.set_environment(environment)
         self.refresh()
 
-    def refresh(self) -> None:
-        self.environment_view.refresh()
-        self.step_log_view.refresh()
-        self.analysis_view.refresh()
-        self.multi_run_view.refresh()
+    def request_refresh(self) -> None:
+        """Coalesce event-driven updates instead of repainting every ACT-R event."""
+        self._refresh_pending = True
+        if self._refresh_timer.isActive():
+            return
+        automatic_running = (
+            str(getattr(self.simulation, "execution_mode", "single"))
+            == "automatic"
+            and str(getattr(self.simulation, "run_state", "not_started"))
+            == "running"
+        )
+        interval = (
+            self.AUTOMATIC_REFRESH_INTERVAL_MS
+            if automatic_running
+            else self.IDLE_REFRESH_INTERVAL_MS
+        )
+        self._refresh_timer.start(interval)
+
+    def _perform_scheduled_refresh(self) -> None:
+        if not self._refresh_pending:
+            return
+        self._refresh_pending = False
+        self.refresh(force=False)
+
+    def _visible_view_changed(self, *_args) -> None:
+        """Paint the newly selected page first, then load only that page."""
+        QTimer.singleShot(0, lambda: self.refresh(force=True))
+
+    def refresh(self, *, force: bool = True) -> None:
+        if force and self._refresh_timer.isActive():
+            self._refresh_timer.stop()
+        if force:
+            self._refresh_pending = False
+
+        # Runtime views are mutually exclusive. Hidden graphs and tables must
+        # not consume time while Automatic continues in the GUI event loop.
+        current_page = self.content_stack.currentIndex()
+        if current_page == 0:
+            if self.left_tabs.currentWidget() is self.environment_view:
+                self.environment_view.refresh()
+            self.step_log_view.refresh(force=force)
+        elif current_page == 1:
+            self.analysis_view.refresh(force=force)
+        elif current_page == 2:
+            self.multi_run_view.refresh()
+
         initialized = bool(getattr(self.simulation, "initialized", False))
         run_state = str(
             getattr(self.simulation, "run_state", "not_started")
@@ -529,6 +593,7 @@ class SimulationMainWindow(QMainWindow):
                     target,
                 ),
                 parent=self,
+                task_manager=self.background_tasks,
             )
             self.jump_dialog.show()
             self.jump_dialog.raise_()

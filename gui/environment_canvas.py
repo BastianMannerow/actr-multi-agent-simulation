@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import QSizePolicy, QToolTip, QWidget
+
+from gui.environment_symbols import (
+    draw_environment_symbol,
+    symbol_for_agent,
+    symbol_for_terrain,
+)
 
 
 class GridCanvas(QWidget):
@@ -88,15 +93,46 @@ class GridCanvas(QWidget):
                 )
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(rect)
+                cell_objects = list(matrix[row][column])
+                terrain = [
+                    obj for obj in cell_objects
+                    if not getattr(obj, "name", None)
+                    and getattr(obj, "symbol", None)
+                ]
                 occupants = [
-                    obj
-                    for obj in matrix[row][column]
+                    obj for obj in cell_objects
                     if getattr(obj, "name", None)
                 ]
+                self._draw_terrain(painter, rect, terrain)
                 self._draw_occupants(painter, rect, occupants)
 
         painter.setPen(QPen(QColor("#46536a"), 1.4))
         painter.drawRect(self._grid_rect)
+
+    def _draw_terrain(
+        self,
+        painter: QPainter,
+        rect: QRectF,
+        terrain: list[Any],
+    ) -> None:
+        if not terrain:
+            return
+        # A cell can contain more than one terrain marker. Render the most
+        # semantically important one instead of relying on insertion order.
+        item = sorted(
+            terrain,
+            key=lambda value: (
+                0 if bool(getattr(value, "is_target", False)) else
+                1 if bool(getattr(value, "blocks_movement", False)) else
+                2 if type(value).__name__ == "Checkpoint" else 3
+            ),
+        )[0]
+        draw_environment_symbol(
+            painter,
+            rect,
+            symbol_for_terrain(item),
+            label=str(getattr(item, "symbol", "?"))[:2].upper(),
+        )
 
     def _draw_occupants(
         self,
@@ -127,39 +163,18 @@ class GridCanvas(QWidget):
                 rect.left() + rect.width() * ox,
                 rect.top() + rect.height() * oy,
             )
-            color = (
-                QColor("#f59e0b")
-                if bool(getattr(occupant, "is_human_controlled", False))
-                else self._agent_color(name)
+            label = name if rect.width() >= 75 else name[:3]
+            draw_environment_symbol(
+                painter,
+                QRectF(
+                    center.x() - radius,
+                    center.y() - radius,
+                    radius * 2,
+                    radius * 2,
+                ),
+                symbol_for_agent(occupant),
+                label=label,
             )
-            painter.setBrush(color)
-            painter.setPen(
-                QPen(
-                    QColor("#f1f4f8"),
-                    max(1.0, rect.width() * 0.025),
-                )
-            )
-            painter.drawEllipse(center, radius, radius)
-
-            if rect.width() >= 28:
-                label = name if rect.width() >= 75 else name[:3]
-                font = QFont(self.font())
-                font.setBold(True)
-                font.setPointSizeF(
-                    max(6.0, min(10.0, radius * 0.42))
-                )
-                painter.setFont(font)
-                painter.setPen(QColor("#081018"))
-                painter.drawText(
-                    QRectF(
-                        center.x() - radius,
-                        center.y() - radius,
-                        radius * 2,
-                        radius * 2,
-                    ),
-                    Qt.AlignmentFlag.AlignCenter,
-                    label,
-                )
 
         if len(occupants) > len(visible):
             painter.setPen(QColor("#d9e0ea"))
@@ -170,12 +185,6 @@ class GridCanvas(QWidget):
                 f"+{len(occupants) - len(visible)}",
             )
         painter.restore()
-
-    @staticmethod
-    def _agent_color(name: str) -> QColor:
-        digest = hashlib.sha256(name.encode("utf-8")).digest()
-        hue = int.from_bytes(digest[:2], "big") % 360
-        return QColor.fromHsl(hue, 145, 178)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         matrix = getattr(self.environment, "level_matrix", None)
@@ -201,9 +210,15 @@ class GridCanvas(QWidget):
                 for obj in matrix[row][column]
                 if getattr(obj, "name", None)
             ]
+            terrain = [
+                str(getattr(obj, "display_name", type(obj).__name__))
+                for obj in matrix[row][column]
+                if not getattr(obj, "name", None)
+            ]
             text = f"Row {row + 1}, column {column + 1}"
-            if names:
-                text += "\n" + "\n".join(names)
+            details = names + terrain
+            if details:
+                text += "\n" + "\n".join(details)
             QToolTip.showText(
                 event.globalPosition().toPoint(),
                 text,

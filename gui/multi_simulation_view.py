@@ -38,7 +38,13 @@ from PyQt6.QtWidgets import (
 )
 
 from simulation.discovery.agent_discovery import AgentDiscovery
-from simulation.config.models import AgentTypeConfig, SPEED_PRESETS, SimulationConfig
+from simulation.config.models import (
+    AgentTypeConfig,
+    ENVIRONMENT_MODES,
+    SPEED_PRESETS,
+    SimulationConfig,
+    VIRTUAL_LEVELS,
+)
 from simulation.batch.multi_run import (
     MultiRunBatch,
     MultiRunScenario,
@@ -49,6 +55,7 @@ from simulation.batch.multi_run import (
     recommended_worker_count,
 )
 from simulation.inspection.source_analysis import AgentSourceAnalyzer
+from simulation.world.level_builder import level_dimensions
 
 
 @dataclass(slots=True)
@@ -56,6 +63,7 @@ class _ScenarioWidgets:
     name: QLineEdit
     repetitions: QSpinBox
     scheduling: QComboBox
+    environment: QComboBox
     speed: QComboBox
     end_condition: QComboBox
     end_value: QLineEdit
@@ -64,12 +72,12 @@ class _ScenarioWidgets:
 
 
 class SimulationSettingsDialog(QDialog):
-    """Edit a complete simulation configuration for one batch scenario."""
+    """Edit one headless virtual-matrix scenario."""
 
     def __init__(self, config: SimulationConfig, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Scenario Simulation Settings")
-        self.resize(620, 650)
+        self.resize(680, 760)
         self._source = config.without_human_agent()
         self._agent_rows: dict[str, tuple[QSpinBox, QCheckBox]] = {}
 
@@ -81,17 +89,31 @@ class SimulationSettingsDialog(QDialog):
 
         environment_group = QGroupBox("Environment", content)
         form = QFormLayout(environment_group)
-        self.width_spin = self._spin(1, 500, self._source.width)
-        self.height_spin = self._spin(1, 500, self._source.height)
+        self.environment_mode_combo = QComboBox(environment_group)
+        for label, value in ENVIRONMENT_MODES:
+            self.environment_mode_combo.addItem(label, value)
+        self.environment_mode_combo.setCurrentIndex(
+            max(0, self.environment_mode_combo.findData(self._source.environment_mode))
+        )
+        self.virtual_level_combo = QComboBox(environment_group)
+        for label, value in VIRTUAL_LEVELS:
+            self.virtual_level_combo.addItem(label, value)
+        self.virtual_level_combo.setCurrentIndex(
+            max(0, self.virtual_level_combo.findData(self._source.virtual_level))
+        )
+        self.matrix_size_label = QLabel(environment_group)
+        self.matrix_size_label.setObjectName("muted")
         self.focus_x_spin = self._spin(-10000, 10000, self._source.focus_position[0])
         self.focus_y_spin = self._spin(-10000, 10000, self._source.focus_position[1])
         self.los_spin = self._spin(0, 1000, self._source.los)
-        form.addRow("Width", self.width_spin)
-        form.addRow("Height", self.height_spin)
+        form.addRow("Backend", self.environment_mode_combo)
+        form.addRow("Level", self.virtual_level_combo)
+        form.addRow("Matrix size", self.matrix_size_label)
         form.addRow("Focus X", self.focus_x_spin)
         form.addRow("Focus Y", self.focus_y_spin)
         form.addRow("Line of sight", self.los_spin)
         content_layout.addWidget(environment_group)
+
 
         logging_group = QGroupBox("Logging", content)
         logging_layout = QVBoxLayout(logging_group)
@@ -134,17 +156,27 @@ class SimulationSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.environment_mode_combo.currentIndexChanged.connect(self._update_environment_controls)
+        self.virtual_level_combo.currentIndexChanged.connect(self._update_environment_controls)
+        self._update_environment_controls()
+
+    def _update_environment_controls(self) -> None:
+        self.virtual_level_combo.setEnabled(True)
+        level = str(self.virtual_level_combo.currentData())
+        height, width = level_dimensions(level)
+        self.matrix_size_label.setText(f"{width} × {height} (defined by Level Builder)")
 
     def configuration(self) -> SimulationConfig:
         config = SimulationConfig(
             focus_position=(self.focus_x_spin.value(), self.focus_y_spin.value()),
             print_middleman=self.middleman_check.isChecked(),
-            width=self.width_spin.value(),
-            height=self.height_spin.value(),
             speed_factor=self._source.speed_factor,
             print_agent_actions=self.agent_actions_check.isChecked(),
             los=self.los_spin.value(),
             execution_mode="single",
+            environment_mode=str(self.environment_mode_combo.currentData()),
+            virtual_level=str(self.virtual_level_combo.currentData()),
+            human_agent_enabled=False,
             agent_type_config={
                 name: AgentTypeConfig(
                     count=count.value(),
@@ -163,6 +195,7 @@ class SimulationSettingsDialog(QDialog):
         spin.setRange(minimum, maximum)
         spin.setValue(value)
         return spin
+
 
 
 class MultiRunThread(QThread):
@@ -350,12 +383,13 @@ class MultiSimulationRunView(QFrame):
         controls.addStretch(1)
         outer.addLayout(controls)
 
-        self.scenario_table = QTableWidget(0, 7, self)
+        self.scenario_table = QTableWidget(0, 8, self)
         self.scenario_table.setHorizontalHeaderLabels(
             [
                 "Scenario",
                 "Repetitions",
                 "Scheduling",
+                "Environment",
                 "Speed",
                 "End condition",
                 "Time / production",
@@ -367,7 +401,7 @@ class MultiSimulationRunView(QFrame):
         self.scenario_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         header_view = self.scenario_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3, 4, 5, 6):
+        for column in (1, 2, 3, 4, 5, 6, 7):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         outer.addWidget(self.scenario_table, 2)
 
@@ -468,6 +502,10 @@ class MultiSimulationRunView(QFrame):
         scheduling.addItem("Parallel", "parallel")
         scheduling.addItem("Sequential", "sequential")
         scheduling.setCurrentIndex(max(0, scheduling.findData(scenario.scheduling)))
+        environment = QComboBox()
+        for label, value in ENVIRONMENT_MODES:
+            environment.addItem(label, value)
+        environment.setCurrentIndex(max(0, environment.findData(scenario.config.environment_mode)))
         speed = QComboBox()
         for label, value in SPEED_PRESETS:
             speed.addItem(label, value)
@@ -482,6 +520,7 @@ class MultiSimulationRunView(QFrame):
             name=name,
             repetitions=repetitions,
             scheduling=scheduling,
+            environment=environment,
             speed=speed,
             end_condition=end_condition,
             end_value=end_value,
@@ -489,11 +528,15 @@ class MultiSimulationRunView(QFrame):
             config=scenario.config.without_human_agent(),
         )
         settings_button.clicked.connect(lambda _checked=False, row=widgets: self._edit_settings(row))
+        environment.currentIndexChanged.connect(
+            lambda _index, row=widgets: self._environment_changed(row)
+        )
+        self._environment_changed(widgets)
         end_condition.currentIndexChanged.connect(
             lambda _index, row=widgets: self._update_end_value_hint(row)
         )
         for column, widget in enumerate(
-            (name, repetitions, scheduling, speed, end_condition, end_value, settings_button)
+            (name, repetitions, scheduling, environment, speed, end_condition, end_value, settings_button)
         ):
             self.scenario_table.setCellWidget(row_index, column, widget)
         self._rows.append(widgets)
@@ -521,6 +564,8 @@ class MultiSimulationRunView(QFrame):
             return
         row = self._rows[index]
         row.config = self._current_config()
+        row.environment.setCurrentIndex(max(0, row.environment.findData(row.config.environment_mode)))
+        self._environment_changed(row)
         row.settings_button.setText(self._settings_summary(row.config))
 
     def _edit_settings(self, row: _ScenarioWidgets) -> None:
@@ -532,6 +577,14 @@ class MultiSimulationRunView(QFrame):
         except Exception as exc:
             QMessageBox.critical(self, "Invalid simulation settings", str(exc))
             return
+        row.environment.setCurrentIndex(max(0, row.environment.findData(row.config.environment_mode)))
+        self._environment_changed(row)
+        row.settings_button.setText(self._settings_summary(row.config))
+
+    def _environment_changed(self, row: _ScenarioWidgets) -> None:
+        mode = str(row.environment.currentData())
+        row.config.environment_mode = mode
+        row.scheduling.setEnabled(True)
         row.settings_button.setText(self._settings_summary(row.config))
 
     def _update_end_value_hint(self, row: _ScenarioWidgets) -> None:
@@ -630,6 +683,8 @@ class MultiSimulationRunView(QFrame):
             self.worker_spin.setEnabled(not self.auto_workers_check.isChecked())
 
     def _scenario_from_widgets(self, row: _ScenarioWidgets) -> MultiRunScenario:
+        config = SimulationConfig.from_dict(row.config.to_dict()).without_human_agent()
+        config.environment_mode = str(row.environment.currentData())
         return MultiRunScenario(
             name=row.name.text().strip(),
             repetitions=row.repetitions.value(),
@@ -637,7 +692,7 @@ class MultiSimulationRunView(QFrame):
             speed_factor=float(row.speed.currentData()),
             end_condition=str(row.end_condition.currentData()),
             end_value=row.end_value.text().strip(),
-            config=row.config.without_human_agent(),
+            config=config,
         )
 
     def _current_config(self) -> SimulationConfig:
@@ -675,7 +730,10 @@ class MultiSimulationRunView(QFrame):
     @staticmethod
     def _settings_summary(config: SimulationConfig) -> str:
         agent_count = sum(item.count for item in config.agent_type_config.values())
-        return f"Edit… · {config.width}×{config.height} · LOS {config.los} · {agent_count} agents"
+        return (
+            f"Edit… · {config.environment_label} · "
+            f"{config.width}×{config.height} · LOS {config.los} · {agent_count} agents"
+        )
 
     @staticmethod
     def _format_duration(seconds: float) -> str:

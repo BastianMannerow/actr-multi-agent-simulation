@@ -1,4 +1,4 @@
-"""Typed simulation configuration shared by the GUI and runtime."""
+"""Typed configuration for interactive and multi-run ACT-R demo simulations."""
 
 from __future__ import annotations
 
@@ -14,11 +14,17 @@ SPEED_PRESETS: tuple[tuple[str, float], ...] = (
     ("ASAP", -1.0),
 )
 
+ENVIRONMENT_MODES: tuple[tuple[str, str], ...] = (
+    ("Virtual Matrix", "virtual"),
+)
+
+VIRTUAL_LEVELS: tuple[tuple[str, str], ...] = (
+    ("Demo Matrix", "demo_matrix"),
+)
+
 
 @dataclass(slots=True)
 class AgentTypeConfig:
-    """Configuration for one dynamically discovered agent model."""
-
     count: int = 1
     print_agent_actions: bool = True
 
@@ -36,23 +42,32 @@ class AgentTypeConfig:
 
 @dataclass(slots=True)
 class SimulationConfig:
-    """All simulation settings that can be edited in the GUI."""
-
     focus_position: tuple[int, int] = (0, 2)
     print_middleman: bool = False
-    width: int = 16
-    height: int = 16
     speed_factor: float = 100.0
     print_agent_actions: bool = True
     los: int = 3
     execution_mode: str = "single"
+    environment_mode: str = "virtual"
+    virtual_level: str = "demo_matrix"
     human_agent_enabled: bool = False
     human_agent_name: str = "Human Player"
     agent_type_config: dict[str, AgentTypeConfig] = field(
         default_factory=lambda: {
-            "Example": AgentTypeConfig(count=1, print_agent_actions=True)
+            "CountingAgent": AgentTypeConfig(count=1, print_agent_actions=True),
+            "Runner": AgentTypeConfig(count=1, print_agent_actions=True),
         }
     )
+
+    @property
+    def height(self) -> int:
+        from simulation.world.level_builder import level_dimensions
+        return level_dimensions(self.virtual_level)[0]
+
+    @property
+    def width(self) -> int:
+        from simulation.world.level_builder import level_dimensions
+        return level_dimensions(self.virtual_level)[1]
 
     @property
     def stepper(self) -> bool:
@@ -65,23 +80,28 @@ class SimulationConfig:
                 return label
         return f"{self.speed_factor:g}%"
 
+    @property
+    def environment_label(self) -> str:
+        labels = {value: label for label, value in ENVIRONMENT_MODES}
+        return labels.get(self.environment_mode, self.environment_mode)
+
     def validate(self) -> None:
-        if self.width < 1 or self.height < 1:
-            raise ValueError("Width and height must both be at least 1.")
-        allowed_speeds = {value for _, value in SPEED_PRESETS}
-        if float(self.speed_factor) not in allowed_speeds:
+        if float(self.speed_factor) not in {value for _, value in SPEED_PRESETS}:
             raise ValueError("The speed must use one of the predefined presets.")
         if self.los < 0:
             raise ValueError("Line of sight cannot be negative.")
         if self.execution_mode not in {"single", "automatic"}:
             raise ValueError("Unknown execution mode.")
+        if self.environment_mode != "virtual":
+            raise ValueError("The Demo Simulation supports only the virtual matrix backend.")
+        if self.virtual_level not in {value for _, value in VIRTUAL_LEVELS}:
+            raise ValueError("Unknown virtual level.")
         if self.human_agent_enabled and not self.human_agent_name.strip():
             raise ValueError("The human agent needs a name.")
         if sum(max(0, item.count) for item in self.agent_type_config.values()) < 1:
-            raise ValueError("At least one agent must be enabled.")
+            raise ValueError("At least one ACT-R agent must be enabled.")
 
     def without_human_agent(self) -> "SimulationConfig":
-        """Return a detached configuration suitable for headless multi-runs."""
         payload = self.to_dict()
         payload["human_agent_enabled"] = False
         payload["human_agent_name"] = "Human Player"
@@ -99,6 +119,9 @@ class SimulationConfig:
             "los": self.los,
             "execution_mode": self.execution_mode,
             "stepper": self.stepper,
+            "environment_mode": self.environment_mode,
+            "environment_label": self.environment_label,
+            "virtual_level": self.virtual_level,
             "human_agent_enabled": self.human_agent_enabled,
             "human_agent_name": self.human_agent_name,
             "agent_type_config": {
@@ -120,29 +143,32 @@ class SimulationConfig:
         agent_types = {
             str(name): AgentTypeConfig.from_dict(value)
             for name, value in raw_agents.items()
-            if isinstance(value, dict)
+            if isinstance(value, dict) and str(name) in {"CountingAgent", "Runner"}
         }
         if not agent_types:
-            agent_types = {"Example": AgentTypeConfig(count=1)}
+            agent_types = {
+                "CountingAgent": AgentTypeConfig(count=1),
+                "Runner": AgentTypeConfig(count=1),
+            }
 
         speed = float(payload.get("speed_factor", 100.0))
-        allowed_speeds = {value for _, value in SPEED_PRESETS}
-        if speed not in allowed_speeds:
+        if speed not in {value for _, value in SPEED_PRESETS}:
             speed = 100.0
+        execution_mode = str(payload.get("execution_mode", "single"))
+        if execution_mode not in {"single", "automatic"}:
+            execution_mode = "single"
 
         config = cls(
             focus_position=focus_position,
             print_middleman=bool(payload.get("print_middleman", False)),
-            width=max(1, int(payload.get("width", 16))),
-            height=max(1, int(payload.get("height", 16))),
             speed_factor=speed,
             print_agent_actions=bool(payload.get("print_agent_actions", True)),
             los=max(0, int(payload.get("los", 3))),
-            execution_mode=str(payload.get("execution_mode", "single")),
+            execution_mode=execution_mode,
+            environment_mode="virtual",
+            virtual_level="demo_matrix",
             human_agent_enabled=bool(payload.get("human_agent_enabled", False)),
             human_agent_name=str(payload.get("human_agent_name", "Human Player")).strip() or "Human Player",
             agent_type_config=agent_types,
         )
-        if config.execution_mode not in {"single", "automatic"}:
-            config.execution_mode = "single"
         return config

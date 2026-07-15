@@ -131,11 +131,11 @@ def fix_pyactr() -> None:
 
             # Build a visible-location chunk from the stimulus attributes
             found_stim = stim_attrs
-            filtered = {
-                k: stim_attrs[k]
-                for k in stim_attrs
-                if k not in ("position", "text", "vis_delay")
-            }
+            # Application metadata is deliberately kept outside the pyactr
+            # stimulus dictionary. Standard _visuallocation chunks only need
+            # screen coordinates; arbitrary keys would become unsupported
+            # chunk slots and can crash chunk construction.
+            filtered = {}
             visible_chunk = chunks.makechunk(
                 nameofchunk="vis1",
                 typename="_visuallocation",
@@ -317,8 +317,6 @@ def _foveal_stimulus(
             float(stimulus["position"][1]) - float(focus[1])
         ) ** 2,
     )
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +593,23 @@ def update_utility(agent_construct: Any, production_name: str, utility: float) -
     utility : float
         New utility value.
     """
-    agent_construct.actr_agent.productions[production_name]["utility"] = utility
+    model_production = agent_construct.actr_agent.productions[production_name]
+    model_production["utility"] = utility
+    try:
+        model_production.utility = utility
+    except AttributeError:
+        pass
+
+    simulation = getattr(agent_construct, "simulation", None)
+    production_rules = getattr(simulation, "_Simulation__pr", None)
+    runtime_rules = getattr(production_rules, "rules", None)
+    if runtime_rules is not None and production_name in runtime_rules:
+        runtime_production = runtime_rules[production_name]
+        runtime_production["utility"] = utility
+        try:
+            runtime_production.utility = utility
+        except AttributeError:
+            pass
 
 
 def get_production_utility(
@@ -619,8 +633,13 @@ def get_production_utility(
         entry does not exist.
     """
     try:
-        return agent_construct.actr_agent.productions[production_name]["utility"]
-    except KeyError:
+        simulation = getattr(agent_construct, "simulation", None)
+        production_rules = getattr(simulation, "_Simulation__pr", None)
+        runtime_rules = getattr(production_rules, "rules", None)
+        if runtime_rules is not None and production_name in runtime_rules:
+            return float(runtime_rules[production_name]["utility"])
+        return float(agent_construct.actr_agent.productions[production_name]["utility"])
+    except (KeyError, TypeError, ValueError):
         return None
 
 
@@ -705,7 +724,23 @@ def add_to_declarative_memory(agent_construct: Any, chunk: chunks.Chunk) -> None
     chunk : Chunk
         :class:`pyactr.chunks.Chunk` to be stored.
     """
-    agent_construct.actr_agent.decmem.add(chunk)
+    model = agent_construct.actr_agent
+    model.decmem.add(chunk)
+    registry = getattr(model, "_explicit_declarative_chunks", None)
+    if registry is None:
+        registry = set()
+        model._explicit_declarative_chunks = registry
+    registry.add(chunk)
+
+
+def unregister_explicit_declarative_chunk(
+    agent_construct: Any, chunk: chunks.Chunk
+) -> None:
+    """Remove a replaced chunk from the explicit-memory provenance registry."""
+    model = getattr(agent_construct, "actr_agent", None)
+    registry = getattr(model, "_explicit_declarative_chunks", None)
+    if registry is not None:
+        registry.discard(chunk)
 
 
 def get_declarative_chunk_type(agent_construct: Any, typename: str):

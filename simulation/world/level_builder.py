@@ -1,59 +1,73 @@
+"""Deterministic virtual matrix used by the feature-complete demo GUI."""
+
+from __future__ import annotations
+
 import random
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence
+
+from simulation.world.entities import Checkpoint, Goal, Wall
 
 
-def build_level(height: int, width: int, agents: Sequence[Any], rng: Optional[random.Random] = None) -> List[List[Optional[Any]]]:
-    """
-    Minimal grid builder: randomly place agents on an empty matrix.
+LEVEL_DIMENSIONS: dict[str, tuple[int, int]] = {
+    "demo_matrix": (12, 16),  # (height, width)
+}
 
-    Intent
-    ------
-    - Provide a minimal example.
-    - Fail fast if the grid cannot accommodate all agents.
-    - Keep the API surface small and explicit.
 
-    Parameters
-    ----------
-    height : int
-        Number of rows in the matrix (must be > 0).
-    width : int
-        Number of columns in the matrix (must be > 0).
-    agents : Sequence[Any]
-        Agent objects to place. Each agent occupies exactly one cell.
-    rng : Optional[random.Random]
-        Optional RNG for deterministic placements in tests. Defaults to `random`.
+def level_dimensions(level_type: str) -> tuple[int, int]:
+    try:
+        return LEVEL_DIMENSIONS[level_type]
+    except KeyError as exc:
+        raise ValueError(f"Unknown virtual level: {level_type!r}") from exc
 
-    Returns
-    -------
-    List[List[Optional[Any]]]
-        A `height × width` matrix. Cells contain either `None` or a single agent.
 
-    Raises
-    ------
-    ValueError
-        - If `height` or `width` is non-positive.
-        - If `len(agents) > height * width` (not enough free cells).
-    """
-    if height <= 0 or width <= 0:
-        raise ValueError("height and width must be positive integers")
+def build_level(
+    level_type: str,
+    agents: Sequence[Any],
+    rng: Optional[random.Random] = None,
+) -> list[list[Any | None]]:
+    if level_type != "demo_matrix":
+        raise ValueError(f"Unknown virtual level: {level_type!r}")
+    return _demo_matrix(agents, rng or random.Random())
 
-    total_cells = height * width
-    num_agents = len(agents)
-    if num_agents > total_cells:
-        raise ValueError(
-            f"Not enough space: {num_agents} agents for {total_cells} cells "
-            f"({height}×{width})"
-        )
 
-    # Create an empty matrix
-    matrix: List[List[Optional[Any]]] = [[None for _ in range(width)] for _ in range(height)]
+def _demo_matrix(
+    agents: Sequence[Any], rng: random.Random
+) -> list[list[Any | None]]:
+    height, width = level_dimensions("demo_matrix")
+    matrix: list[list[Any | None]] = [
+        [None for _ in range(width)] for _ in range(height)
+    ]
 
-    # Generate a shuffled list of all cell coordinates; take the first N for agents
-    rng = rng or random
-    coords: List[Tuple[int, int]] = [(r, c) for r in range(height) for c in range(width)]
-    rng.shuffle(coords)
+    walls: set[tuple[int, int]] = set()
+    for row in range(height):
+        walls.add((row, 0))
+        walls.add((row, width - 1))
+    for column in range(width):
+        walls.add((0, column))
+        walls.add((height - 1, column))
 
-    for agent, (r, c) in zip(agents, coords[:num_agents]):
-        matrix[r][c] = agent
+    # Three compact barriers with deliberate gaps. The layout remains easy to
+    # read while supporting collisions, partial perception and route changes.
+    walls.update((row, 5) for row in range(2, 10) if row != 6)
+    walls.update((4, column) for column in range(7, 14) if column != 10)
+    walls.update((8, column) for column in range(8, 15) if column != 12)
+    for row, column in walls:
+        matrix[row][column] = Wall()
 
+    goal_position = (2, 13)
+    matrix[goal_position[0]][goal_position[1]] = Goal()
+    for row, column in ((2, 2), (6, 10), (9, 13)):
+        matrix[row][column] = Checkpoint()
+
+    free_cells = [
+        (row, column)
+        for row in range(1, height - 1)
+        for column in range(1, width - 1)
+        if matrix[row][column] is None
+    ]
+    rng.shuffle(free_cells)
+    if len(free_cells) < len(agents):
+        raise ValueError("Demo Matrix has too few free cells for all agents.")
+    for agent, (row, column) in zip(agents, free_cells):
+        matrix[row][column] = agent
     return matrix

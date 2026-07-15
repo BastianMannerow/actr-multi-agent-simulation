@@ -5,13 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from gui.environment_canvas import GridCanvas
+from gui.environment_symbols import EnvironmentLegendMarker, EnvironmentSymbol
 
 
 class EnvironmentView(QFrame):
-    """Panel containing grid metadata and the reusable renderer."""
+    """Panel containing grid metadata, legend, and the reusable renderer."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -38,6 +39,34 @@ class EnvironmentView(QFrame):
 
         self.canvas = GridCanvas(self)
         layout.addWidget(self.canvas, 1)
+        layout.addWidget(self._build_legend())
+
+    def _build_legend(self) -> QWidget:
+        legend = QFrame(self)
+        legend.setObjectName("toolbar")
+        row = QHBoxLayout(legend)
+        row.setContentsMargins(10, 7, 10, 7)
+        row.setSpacing(14)
+        row.addWidget(self._legend_item(EnvironmentSymbol.WALL, "Wall (blocked)"))
+        row.addWidget(self._legend_item(EnvironmentSymbol.CHECKPOINT, "Checkpoint"))
+        row.addWidget(self._legend_item(EnvironmentSymbol.GOAL, "Goal"))
+        row.addWidget(self._legend_item(EnvironmentSymbol.ACTR_AGENT, "ACT-R agent"))
+        row.addWidget(self._legend_item(EnvironmentSymbol.HUMAN_AGENT, "Human agent"))
+        row.addStretch(1)
+        return legend
+
+    @staticmethod
+    def _legend_item(symbol: EnvironmentSymbol, text: str) -> QWidget:
+        item = QWidget()
+        item_layout = QHBoxLayout(item)
+        item_layout.setContentsMargins(0, 0, 0, 0)
+        item_layout.setSpacing(5)
+        marker = EnvironmentLegendMarker(symbol, item)
+        label = QLabel(text)
+        label.setObjectName("muted")
+        item_layout.addWidget(marker)
+        item_layout.addWidget(label)
+        return item
 
     def set_environment(self, environment: Any) -> None:
         self.environment = environment
@@ -54,8 +83,11 @@ class EnvironmentView(QFrame):
                 for obj in cell
                 if getattr(obj, "name", None)
             )
+            backend = str(getattr(self.environment, "backend_name", "virtual")).upper()
+            level_name = str(getattr(self.environment, "level_name", "")).strip()
+            level_text = f" · {level_name}" if level_name else ""
             self.info_label.setText(
-                f"{len(matrix[0])} × {len(matrix)} · "
+                f"{backend}{level_text} · {len(matrix[0])} × {len(matrix)} · "
                 f"{agent_count} agent"
                 f"{'s' if agent_count != 1 else ''}"
             )

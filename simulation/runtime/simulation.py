@@ -18,13 +18,13 @@ from simulation.integrations import pyactr_extension
 from simulation.runtime.agent_construct import AgentConstruct
 from simulation.runtime.agent_type_factory import AgentTypeReturner
 from simulation.world.environment import Environment
+from simulation.world.factory import create_environment
 from simulation.world.human_agent import HumanAgent
 from simulation.runtime.middleman import Middleman
 from simulation.inspection.buffer_history import BufferHistoryRecorder
 from simulation.config.models import SPEED_PRESETS, SimulationConfig
 from simulation.config.settings_store import SimulationSettingsStore
 from simulation.export.history_export import SimulationHistoryExporter
-from simulation.world import level_builder
 
 
 class Simulation:
@@ -84,6 +84,11 @@ class Simulation:
         """Build or rebuild a simulation from the complete GUI configuration."""
         config.validate()
         self.stop_execution()
+        if self.game_environment is not None:
+            try:
+                self.game_environment.close()
+            except Exception:
+                pass
         self.config = config
         if self.settings_store is not None:
             self.settings_store.save(config)
@@ -104,15 +109,17 @@ class Simulation:
         )
         self.middleman = Middleman(self, config.print_middleman)
         self.agent_builder()
-        level_matrix = level_builder.build_level(
-            config.height, config.width, self.spatial_agents
+        self.game_environment = create_environment(
+            config,
+            self.spatial_agents,
+            self,
         )
-        self.game_environment = Environment(level_matrix)
         self.middleman.set_game_environment(self.game_environment)
 
-        # Create every pyactr simulation with the real initial matrix frame.
-        # This removes the old dummy stimulus and ensures that later
-        # EmptySchedule resets reuse a valid, current frame as well.
+        # Build each pyactr simulation with the real initial level frame rather
+        # than a dummy stimulus. This prevents the first environment event from
+        # overwriting current world data and makes later EmptySchedule resets
+        # reuse a valid, up-to-date frame.
         for agent in self.agent_list:
             agent.update_stimulus(publish=False)
             agent.set_simulation()
@@ -280,6 +287,11 @@ class Simulation:
         self.jumping = False
         if self.initialized:
             self.run_state = "stopped"
+        if self.game_environment is not None:
+            try:
+                self.game_environment.close()
+            except Exception:
+                pass
 
     def step_once(self, *, force: bool = False) -> bool:
         """Execute one visible cognitive event."""
@@ -335,9 +347,9 @@ class Simulation:
         pyactr_extension.fix_pyactr()
         self.agent_list.sort(key=lambda agent: agent.actr_time)
         agent = self.agent_list[0]
-        # The pyactr Environment is shared. Publish only the point of view of
-        # the agent that is about to step; otherwise the final agent updated in
-        # a loop would overwrite the frame consumed by the scheduled agent.
+        # The pyactr Environment is shared. Publish only the frame of the agent
+        # that is about to step, so its visual requests and automatic buffers
+        # cannot accidentally consume another agent's point of view.
         agent.update_stimulus(publish=True)
 
         try:
@@ -554,7 +566,11 @@ class Simulation:
 
     def notify_gui(self) -> None:
         if self.main_window is not None:
-            self.main_window.refresh()
+            signal = getattr(self.main_window, "refresh_requested", None)
+            if signal is not None:
+                signal.emit()
+            else:
+                self.main_window.refresh()
 
     def _mirror_config_attributes(self) -> None:
         """Keep the public settings from the original Simulation API available."""
@@ -568,6 +584,8 @@ class Simulation:
         self.stepper = self.config.stepper
         self.human_agent_enabled = self.config.human_agent_enabled
         self.human_agent_name = self.config.human_agent_name
+        self.environment_mode = self.config.environment_mode
+        self.virtual_level = self.config.virtual_level
         self.agent_type_config = {
             name: value.to_dict()
             for name, value in self.config.agent_type_config.items()

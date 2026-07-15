@@ -49,7 +49,8 @@ class AgentConstruct(SpatialAgent):
         self.actr_agent_type_name = actr_agent_type_name
         self.actr_environment = actr_environment
         self.simulation = simulation         # High-level Simulation reference (set later if None).
-        self.actr_construct = None           # Placeholder for future replacement; deprecated internal reference.
+        self.actr_construct = None           # Model-builder instance.
+        self.uses_visual_module = True        # May be disabled by an agent model.
 
         # --- Metadata and runtime identifiers ---
         self.name_number = name_number       # Public GUI identifier, used to bind visuals to agents.
@@ -61,8 +62,10 @@ class AgentConstruct(SpatialAgent):
         # --- Perceptual input placeholders ---
         self.visual_stimuli = []             # Human-readable matrix around the agent.
         self.visual_metadata = {}            # Rich metadata kept outside pyactr stimuli.
-        self.triggers = [set()]               # One trigger collection per visual frame.
-        self.stimuli = [{}]                   # One pyactr-safe visual frame.
+        self.visual_frame_origin = (0, 0)    # World coordinate of visual_stimuli[0][0].
+        self.visual_frame_valid_positions = set()  # In-bounds cells in the current frame.
+        self.triggers = [set()]              # One trigger collection per visual frame.
+        self.stimuli = [{}]                  # One pyactr-safe visual frame.
 
     # ---------------------------
     # Initialization utilities
@@ -82,8 +85,11 @@ class AgentConstruct(SpatialAgent):
         actr_adapter.agent_construct = self
 
     def set_actr_construct(self, actr_construct):
-        """Attach the ACT-R construct wrapper (legacy field, reserved for compatibility)."""
+        """Attach the model builder and read its perceptual architecture flag."""
         self.actr_construct = actr_construct
+        self.uses_visual_module = bool(
+            getattr(actr_construct, "uses_visual_module", True)
+        )
 
     def set_simulation(self):
         """Initialize the ACT-R simulation and load the model's initial goal."""
@@ -100,15 +106,21 @@ class AgentConstruct(SpatialAgent):
             except (AttributeError, StopIteration, TypeError):
                 pass
 
-        self.simulation = self.actr_agent.simulation(
-            realtime=self.realtime,
-            environment_process=self.actr_environment.environment_process,
-            stimuli=self.stimuli,
-            triggers=self.triggers,
-            times=0.1,
-            gui=False,
-            trace=False
-        )
+        simulation_kwargs = {
+            "realtime": self.realtime,
+            "gui": False,
+            "trace": False,
+        }
+        if self.uses_visual_module:
+            simulation_kwargs.update(
+                {
+                    "environment_process": self.actr_environment.environment_process,
+                    "stimuli": self.stimuli,
+                    "triggers": self.triggers,
+                    "times": 0.1,
+                }
+            )
+        self.simulation = self.actr_agent.simulation(**simulation_kwargs)
 
     # ---------------------------
     # Social identification
@@ -143,20 +155,20 @@ class AgentConstruct(SpatialAgent):
     # Perception pipeline
     # ---------------------------
     def update_stimulus(self, *, publish: bool = True):
-        """Refresh this agent's live pyactr visual frame.
+        """Refresh the live pyactr visual frame for this agent.
 
-        The Middleman returns only pyactr-supported stimulus fields. Rich
-        matrix metadata remains available separately in ``visual_metadata``.
-        If a cognitive simulation already exists, the latest frame is
-        published immediately and automatic visual buffers are refreshed with
-        pyactr's own buffer/chunk APIs.
+        The Middleman returns only pyactr-supported stimulus fields. Rich world
+        metadata remains available separately in ``visual_metadata``. When a
+        running cognitive simulation exists, the updated frame is published to
+        pyactr immediately and automatic visual buffers are refreshed with
+        pyactr's own chunk constructors.
         """
         if not self.middleman.experiment_environment:
             return
         new_triggers, new_stimuli = self.middleman.get_agent_stimulus(self)
         self.triggers = new_triggers
         self.stimuli = new_stimuli
-        if publish:
+        if publish and self.uses_visual_module:
             pyactr_extension.publish_visual_stimulus(self)
 
     # ---------------------------
@@ -189,15 +201,21 @@ class AgentConstruct(SpatialAgent):
         first_goal = next(iter(self.actr_agent.goals.values()))
         first_goal.add(default_goal)
 
-        self.simulation = self.actr_agent.simulation(
-            realtime=self.realtime,
-            environment_process=self.actr_environment.environment_process,
-            stimuli=self.stimuli,
-            triggers=self.triggers,
-            times=0.1,
-            gui=False,
-            trace=False
-        )
+        simulation_kwargs = {
+            "realtime": self.realtime,
+            "gui": False,
+            "trace": False,
+        }
+        if self.uses_visual_module:
+            simulation_kwargs.update(
+                {
+                    "environment_process": self.actr_environment.environment_process,
+                    "stimuli": self.stimuli,
+                    "triggers": self.triggers,
+                    "times": 0.1,
+                }
+            )
+        self.simulation = self.actr_agent.simulation(**simulation_kwargs)
 
     def handle_empty_schedule(self):
         """

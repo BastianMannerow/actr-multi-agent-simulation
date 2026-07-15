@@ -52,13 +52,16 @@ class SimulationHistoryExporter:
 
         manifest = {
             "schema_version": self.SCHEMA_VERSION,
-            "application": "ACT-R Multi-Agent Simulation",
+            "application": "ACT-R Demo Simulation",
             "exported_at_utc": datetime.now(timezone.utc).isoformat(),
             "simulation_time": float(
                 getattr(simulation, "global_sim_time", 0.0)
             ),
             "execution_mode": getattr(simulation, "execution_mode", None),
             "run_state": getattr(simulation, "run_state", None),
+            "environment_mode": config_payload.get("environment_mode"),
+            "environment_label": config_payload.get("environment_label"),
+            "virtual_level": config_payload.get("virtual_level"),
             "event_count": len(records),
             "agent_count": len(spatial_agents),
             "cognitive_agent_count": len(agents),
@@ -275,7 +278,7 @@ class SimulationHistoryExporter:
     def _serialize_environment(environment: Any) -> dict[str, Any]:
         matrix = getattr(environment, "level_matrix", None)
         if not matrix:
-            return {"width": 0, "height": 0, "cells": []}
+            return {"backend": None, "width": 0, "height": 0, "cells": []}
         cells = []
         for row_index, row in enumerate(matrix):
             for column_index, cell in enumerate(row):
@@ -288,6 +291,9 @@ class SimulationHistoryExporter:
                                 f"{type(item).__module__}."
                                 f"{type(item).__name__}"
                             ),
+                            "display_name": getattr(item, "display_name", None),
+                            "symbol": getattr(item, "symbol", None),
+                            "blocks_movement": bool(getattr(item, "blocks_movement", False)),
                             "repr": repr(item),
                         }
                     )
@@ -300,6 +306,7 @@ class SimulationHistoryExporter:
                         }
                     )
         return {
+            "backend": getattr(environment, "backend_name", None),
             "width": len(matrix[0]) if matrix and matrix[0] else 0,
             "height": len(matrix),
             "cells": cells,

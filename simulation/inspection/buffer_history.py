@@ -96,7 +96,22 @@ class BufferHistoryRecorder:
     def history(
         self, agent_name: str, buffer_name: str
     ) -> list[dict[str, Any]]:
+        """Return a copy for exports and external consumers."""
         return list(self._history.get(agent_name, {}).get(buffer_name, []))
+
+    def history_view(
+        self, agent_name: str, buffer_name: str
+    ) -> list[dict[str, Any]]:
+        """Return the append-only internal list for virtualized GUI models.
+
+        Callers must treat the returned list as read-only.  Avoiding a full copy
+        is essential when a buffer has accumulated hundreds of thousands of
+        changes.
+        """
+        return self._history.get(agent_name, {}).get(buffer_name, [])
+
+    def history_count(self, agent_name: str, buffer_name: str) -> int:
+        return len(self._history.get(agent_name, {}).get(buffer_name, ()))
 
     def latest(
         self, agent_name: str, buffer_name: str
