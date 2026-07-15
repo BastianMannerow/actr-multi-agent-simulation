@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import heapq
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ from simulation.inspection.buffer_history import BufferHistoryRecorder
 from simulation.config.models import SPEED_PRESETS, SimulationConfig
 from simulation.config.settings_store import SimulationSettingsStore
 from simulation.export.history_export import SimulationHistoryExporter
+from pyactr_overrides import manager as pyactr_performance
 
 
 _TIME_EPSILON = 1e-9
@@ -41,12 +44,19 @@ class Simulation:
         self.buffer_history = BufferHistoryRecorder()
         self.history_exporter = SimulationHistoryExporter()
         self.settings_store: SimulationSettingsStore | None = None
+        pyactr_extension.fix_pyactr()
+        self._devnull = open(os.devnull, "w", encoding="utf-8")
 
         # pyactr Event.time values are absolute model times.  Keep the
         # wrapper clock on exactly the same absolute time base.
         self.global_sim_time = 0.0
         self._last_global_time_delta = 0.0
         self.agent_list: list[AgentConstruct] = []
+        self._agents_by_name: dict[str, AgentConstruct] = {}
+        self._active_agent_ids: set[int] = set()
+        self._schedule_heap: list[tuple[float, int, int, AgentConstruct]] = []
+        self._schedule_versions: dict[int, int] = {}
+        self._schedule_serial = 0
         self.human_agent: HumanAgent | None = None
         self.actr_environment: Any | None = None
         self.middleman: Middleman | None = None
@@ -56,6 +66,8 @@ class Simulation:
         self.main_window: SimulationMainWindow | None = None
         self._auto_timer: QTimer | None = None
         self._jump_timer: QTimer | None = None
+        self._gui_notify_timer: QTimer | None = None
+        self._gui_notify_pending = False
 
         self.initialized = False
         self.run_state = "not_started"
@@ -65,6 +77,14 @@ class Simulation:
         self.jump_agent_name: str | None = None
         self.last_error: str | None = None
         self._mirror_config_attributes()
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_devnull", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     def run_simulation(self) -> int:
         """Open the maximized GUI; the model is started from the GUI."""
@@ -79,6 +99,9 @@ class Simulation:
         self._jump_timer = QTimer()
         self._jump_timer.setSingleShot(True)
         self._jump_timer.timeout.connect(self._jump_tick)
+        self._gui_notify_timer = QTimer()
+        self._gui_notify_timer.setSingleShot(True)
+        self._gui_notify_timer.timeout.connect(self._flush_gui_notification)
 
         self.main_window = SimulationMainWindow(
             tracer=self.interceptor,
@@ -97,6 +120,9 @@ class Simulation:
             except Exception:
                 pass
         self.config = config
+        pyactr_performance.configure(
+            config.experimental_pyactr_performance_boost
+        )
         if self.settings_store is not None:
             self.settings_store.save(config)
         self._mirror_config_attributes()
@@ -104,6 +130,11 @@ class Simulation:
         self.global_sim_time = 0.0
         self._last_global_time_delta = 0.0
         self.agent_list.clear()
+        self._agents_by_name.clear()
+        self._active_agent_ids.clear()
+        self._schedule_heap.clear()
+        self._schedule_versions.clear()
+        self._schedule_serial = 0
         self.human_agent = None
         self.interceptor.clear()
         self.buffer_history.clear()
@@ -129,9 +160,10 @@ class Simulation:
         # overwriting current world data and makes later EmptySchedule resets
         # reuse a valid, up-to-date frame.
         for agent in self.agent_list:
-            agent.update_stimulus(publish=False)
+            agent.update_stimulus(publish=False, force=True)
             agent.set_simulation()
             agent.update_stimulus(publish=True)
+            self._schedule_agent(agent)
             self.buffer_history.capture_agent(
                 agent, force=True, reason="initialization"
             )
@@ -175,6 +207,8 @@ class Simulation:
                 agent.actr_time = 0.0
                 agent.print_agent_actions = print_actions
                 self.agent_list.append(agent)
+                self._agents_by_name[name] = agent
+                self._active_agent_ids.add(id(agent))
 
         if self.config.human_agent_enabled:
             human_name = self.config.human_agent_name.strip()
@@ -337,26 +371,48 @@ class Simulation:
     def _automatic_tick(self) -> None:
         if self.run_state != "running" or self.execution_mode != "automatic":
             return
-        self._execute_next_event()
+        if float(self.speed_factor) == -1.0:
+            deadline = time.perf_counter() + 0.010
+            processed = 0
+            while (
+                self.agent_list
+                and self.run_state == "running"
+                and time.perf_counter() < deadline
+                and processed < 128
+            ):
+                if self._execute_next_event(notify=False) is None and not self.agent_list:
+                    break
+                processed += 1
+            self.notify_gui()
+        else:
+            self._execute_next_event()
         if not self.agent_list:
             self.run_state = "finished"
-            self.notify_gui()
+            self.notify_gui(force=True)
             return
         self._schedule_automatic_step()
 
-    def _execute_next_event(self) -> tuple[AgentConstruct, Any] | None:
+    def _execute_next_event(
+        self, *, notify: bool = True
+    ) -> tuple[AgentConstruct, Any] | None:
         if not self.agent_list:
             self.run_state = "finished"
             self.notify_gui()
             return None
 
         assert self.middleman is not None
-        pyactr_extension.fix_pyactr()
-        # Each agent owns an independent pyactr clock.  Advancing the agent
-        # with the lowest current model time keeps agents approximately in
-        # lockstep without pre-executing events from another world state.
-        self.agent_list.sort(key=lambda candidate: candidate.actr_time)
-        agent = self.agent_list[0]
+        # Schedule by the next event already queued inside each independent
+        # pyactr/SimPy environment. A versioned heap avoids sorting every agent
+        # before every visible event.
+        agent = self._pop_scheduled_agent()
+        if agent is None:
+            self._rebuild_schedule()
+            agent = self._pop_scheduled_agent()
+        if agent is None:
+            self.run_state = "finished"
+            if notify:
+                self.notify_gui(force=True)
+            return None
         previous_agent_time = float(agent.actr_time)
         previous_global_time = float(self.global_sim_time)
         # The pyactr Environment is shared. Publish only the frame of the agent
@@ -406,22 +462,18 @@ class Simulation:
                     f"{_MAX_CONSECUTIVE_ZERO_TIME_EVENTS} consecutive "
                     "events without advancing ACT-R time."
                 )
-                self.agent_list.remove(agent)
-                if self.game_environment is not None:
-                    self.game_environment.remove_agent_from_game(agent)
+                self._remove_agent(agent)
                 if not self.agent_list:
                     self.run_state = "finished"
-                self.notify_gui()
+                if notify:
+                    self.notify_gui(force=True)
                 return None
 
             agent.actr_time = event_time
             # Agents run on independent absolute pyactr clocks.  The shared
             # elapsed model time is the furthest local clock reached, not the
             # sum of event timestamps.
-            self.global_sim_time = max(
-                [float(item.actr_time) for item in self.agent_list],
-                default=event_time,
-            )
+            self.global_sim_time = max(self.global_sim_time, event_time)
             self._last_global_time_delta = max(
                 0.0, self.global_sim_time - previous_global_time
             )
@@ -436,7 +488,9 @@ class Simulation:
             self.buffer_history.capture_agent(
                 agent, event=event, reason="event"
             )
-            self.notify_gui()
+            self._schedule_agent(agent)
+            if notify:
+                self.notify_gui()
             return agent, event
 
         except (
@@ -460,13 +514,78 @@ class Simulation:
                     f"{type(reset_exc).__name__}: {reset_exc}"
                 )
                 if agent in self.agent_list:
-                    self.agent_list.remove(agent)
-                    if self.game_environment is not None:
-                        self.game_environment.remove_agent_from_game(agent)
+                    self._remove_agent(agent)
                 if not self.agent_list:
                     self.run_state = "finished"
-            self.notify_gui()
+            else:
+                self._schedule_agent(agent)
+            if notify:
+                self.notify_gui(force=True)
             return None
+
+    @staticmethod
+    def _next_scheduled_time(agent: AgentConstruct) -> float:
+        simulation = getattr(agent, "simulation", None)
+        if simulation is None:
+            return float("inf")
+        peek = getattr(simulation, "peek_next_event_time", None)
+        if callable(peek):
+            try:
+                return float(peek())
+            except Exception:
+                pass
+        environment = getattr(simulation, "_Simulation__simulation", None)
+        try:
+            return float(environment.peek())
+        except Exception:
+            return float("inf")
+
+    def _schedule_agent(self, agent: AgentConstruct) -> None:
+        if id(agent) not in self._active_agent_ids:
+            return
+        identifier = id(agent)
+        version = self._schedule_versions.get(identifier, 0) + 1
+        self._schedule_versions[identifier] = version
+        self._schedule_serial += 1
+        heapq.heappush(
+            self._schedule_heap,
+            (
+                self._next_scheduled_time(agent),
+                self._schedule_serial,
+                version,
+                agent,
+            ),
+        )
+
+    def _pop_scheduled_agent(self) -> AgentConstruct | None:
+        while self._schedule_heap:
+            _time, _serial, version, agent = heapq.heappop(
+                self._schedule_heap
+            )
+            identifier = id(agent)
+            if identifier not in self._active_agent_ids:
+                continue
+            if self._schedule_versions.get(identifier) != version:
+                continue
+            return agent
+        return None
+
+    def _rebuild_schedule(self) -> None:
+        self._schedule_heap.clear()
+        for agent in self.agent_list:
+            self._schedule_agent(agent)
+
+    def _remove_agent(self, agent: AgentConstruct) -> None:
+        if agent in self.agent_list:
+            self.agent_list.remove(agent)
+        identifier = id(agent)
+        self._active_agent_ids.discard(identifier)
+        self._schedule_versions.pop(identifier, None)
+        name = str(getattr(agent, "name", ""))
+        if self._agents_by_name.get(name) is agent:
+            self._agents_by_name.pop(name, None)
+        if self.game_environment is not None:
+            self.game_environment.remove_agent_from_game(agent)
 
     def start_jump(
         self, production_name: str, agent_name: str | None = None
@@ -583,10 +702,7 @@ class Simulation:
         return config
 
     def get_agent_by_name(self, agent_name: str) -> AgentConstruct | None:
-        for agent in self.agent_list:
-            if str(getattr(agent, "name", "")) == str(agent_name):
-                return agent
-        return None
+        return self._agents_by_name.get(str(agent_name))
 
     def replace_agent_buffer_from_string(
         self, agent_name: str, buffer_name: str, chunk_string: str
@@ -597,7 +713,7 @@ class Simulation:
         chunk = pyactr_extension.chunk_from_string(chunk_string)
         pyactr_extension.replace_buffer(agent, buffer_name, chunk)
         self.buffer_history.capture_agent(
-            agent, force=True, reason="manual_buffer_update"
+            agent, reason="manual_buffer_update"
         )
         self.last_error = None
         self.notify_gui()
@@ -609,13 +725,36 @@ class Simulation:
             self.buffer_history.capture_agent(agent, reason="export")
         return self.history_exporter.export(path, self)
 
-    def notify_gui(self) -> None:
-        if self.main_window is not None:
-            signal = getattr(self.main_window, "refresh_requested", None)
-            if signal is not None:
-                signal.emit()
-            else:
-                self.main_window.refresh()
+    def notify_gui(self, *, force: bool = False) -> None:
+        if self.main_window is None:
+            return
+        automatic = (
+            not force
+            and self.execution_mode == "automatic"
+            and self.run_state == "running"
+            and self._gui_notify_timer is not None
+        )
+        if automatic:
+            self._gui_notify_pending = True
+            if not self._gui_notify_timer.isActive():
+                self._gui_notify_timer.start(33)
+            return
+        self._emit_gui_refresh()
+
+    def _flush_gui_notification(self) -> None:
+        if not self._gui_notify_pending:
+            return
+        self._gui_notify_pending = False
+        self._emit_gui_refresh()
+
+    def _emit_gui_refresh(self) -> None:
+        if self.main_window is None:
+            return
+        signal = getattr(self.main_window, "refresh_requested", None)
+        if signal is not None:
+            signal.emit()
+        else:
+            self.main_window.refresh()
 
     def _mirror_config_attributes(self) -> None:
         """Keep the public settings from the original Simulation API available."""
@@ -625,6 +764,9 @@ class Simulation:
         self.height = self.config.height
         self.speed_factor = self.config.speed_factor
         self.print_agent_actions = self.config.print_agent_actions
+        self.experimental_pyactr_performance_boost = (
+            self.config.experimental_pyactr_performance_boost
+        )
         self.los = self.config.los
         self.stepper = self.config.stepper
         self.human_agent_enabled = self.config.human_agent_enabled
@@ -638,11 +780,10 @@ class Simulation:
 
     @contextlib.contextmanager
     def suppress_stdout(self):
-        """Suppress verbose pyactr traces while preserving framework logs."""
-        with open(os.devnull, "w") as devnull:
-            old_stdout = sys.stdout
-            sys.stdout = devnull
-            try:
-                yield
-            finally:
-                sys.stdout = old_stdout
+        """Suppress optional pyactr prints without reopening os.devnull per event."""
+        old_stdout = sys.stdout
+        sys.stdout = self._devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout

@@ -161,6 +161,17 @@ class SimulationConfigView(QFrame):
         self.print_agent_actions_check = QCheckBox("Print agent actions by default", group)
         self.print_agent_actions_check.setChecked(self._current_config.print_agent_actions)
         form.addRow(self.print_agent_actions_check)
+        self.experimental_pyactr_boost_check = QCheckBox(
+            "Experimental pyactr performance boost", group
+        )
+        self.experimental_pyactr_boost_check.setChecked(
+            self._current_config.experimental_pyactr_performance_boost
+        )
+        self.experimental_pyactr_boost_check.setToolTip(
+            "Activates reversible overrides from pyactr_overrides only for the next simulation. "
+            "The default pyactr implementation remains active when this toggle is off."
+        )
+        form.addRow(self.experimental_pyactr_boost_check)
         return group
 
     def _environment_mode_changed(self) -> None:
@@ -239,6 +250,9 @@ class SimulationConfigView(QFrame):
             print_middleman=self.print_middleman_check.isChecked(),
             speed_factor=float(speed_factor),
             print_agent_actions=self.print_agent_actions_check.isChecked(),
+            experimental_pyactr_performance_boost=(
+                self.experimental_pyactr_boost_check.isChecked()
+            ),
             los=self.los_spin.value(),
             execution_mode=execution_mode,
             environment_mode=str(self.environment_mode_combo.currentData()),
@@ -268,6 +282,9 @@ class SimulationConfigView(QFrame):
         self.human_name_edit.setText(config.human_agent_name)
         self.print_middleman_check.setChecked(config.print_middleman)
         self.print_agent_actions_check.setChecked(config.print_agent_actions)
+        self.experimental_pyactr_boost_check.setChecked(
+            config.experimental_pyactr_performance_boost
+        )
         self.refresh_agent_types()
         self._environment_mode_changed()
 
@@ -281,6 +298,7 @@ class SimulationConfigView(QFrame):
             self.human_group,
             self.print_middleman_check,
             self.print_agent_actions_check,
+            self.experimental_pyactr_boost_check,
             self.refresh_agents_button,
         ):
             widget.setEnabled(not locked)

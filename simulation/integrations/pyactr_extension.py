@@ -24,6 +24,9 @@ from pyactr import chunks, utilities
 from pyactr.utilities import ACTRError
 
 
+_VISUAL_PATCHED = False
+
+
 def fix_pyactr() -> None:
     """
     Monkey-patch pyACT-R's :class:`VisualLocation` search routine.
@@ -44,6 +47,10 @@ def fix_pyactr() -> None:
     (:class:`pyactr.vision.VisualLocation`). Call it once during
     application start-up, before running simulations.
     """
+    global _VISUAL_PATCHED
+    if _VISUAL_PATCHED:
+        return
+    _VISUAL_PATCHED = True
     _original_find = vision.VisualLocation.find  # kept for potential restoration
 
     def patched_find(self, otherchunk, actrvariables=None, extra_tests=None):
@@ -273,6 +280,9 @@ def publish_visual_stimulus(agent_construct: Any) -> dict[str, dict[str, Any]]:
             continue
 
     if buffers_changed:
+        marker = getattr(agent_construct, "mark_buffer_dirty", None)
+        if callable(marker):
+            marker("visual", "visual_location")
         activation = getattr(simulation, "_Simulation__proc_activate", None)
         try:
             if activation is not None and not activation.triggered:
@@ -529,6 +539,9 @@ def replace_buffer(agent_construct: Any, name: str, chunk: chunks.Chunk) -> None
         pass
     if chunk is not None:
         buffer.add(chunk)
+    marker = getattr(agent_construct, "mark_buffer_dirty", None)
+    if callable(marker):
+        marker(name)
 
 
 def set_buffer(agent_construct: Any, name: str, chunk: chunks.Chunk) -> None:
@@ -573,6 +586,9 @@ def set_imaginal(agent_construct: Any, new_chunk: chunks.Chunk, key: str) -> Non
         target.add(new_chunk)
     except AttributeError as exc:
         raise TypeError(f"Goal object for '{key}' does not support '.add()'.") from exc
+    marker = getattr(agent_construct, "mark_buffer_dirty", None)
+    if callable(marker):
+        marker(key)
 
 
 # ---------------------------------------------------------------------------

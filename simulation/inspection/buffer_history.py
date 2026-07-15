@@ -29,13 +29,11 @@ class BufferHistoryRecorder:
             lambda: defaultdict(list)
         )
         self._latest: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-        self._signatures: dict[tuple[str, str], str] = {}
         self._sequence = 0
 
     def clear(self) -> None:
         self._history.clear()
         self._latest.clear()
-        self._signatures.clear()
         self._sequence = 0
 
     def capture_agent(
@@ -46,25 +44,41 @@ class BufferHistoryRecorder:
         force: bool = False,
         reason: str = "event",
     ) -> list[dict[str, Any]]:
-        """Inspect all current buffers and append entries only for real changes."""
+        """Capture only buffers that can have changed since the previous event."""
         changed: list[dict[str, Any]] = []
         event_type, event_description = self._event_parts(event)
         timestamp = float(getattr(agent, "actr_time", 0.0))
         agent_name = str(getattr(agent, "name", "Unknown agent"))
+        buffers = self.discover_buffers(agent)
+        current_names = set(buffers)
+        known_names = set(getattr(agent, "_known_buffer_names", set()))
 
-        for buffer_name, buffer in self.discover_buffers(agent).items():
-            snapshot = self.serialize_buffer(buffer)
-            signature = json.dumps(
-                snapshot,
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
+        if force:
+            candidate_names = current_names
+            consumer = getattr(agent, "consume_dirty_buffers", None)
+            if callable(consumer):
+                consumer()
+        else:
+            candidate_names = current_names - known_names
+            consumer = getattr(agent, "consume_dirty_buffers", None)
+            if callable(consumer):
+                candidate_names.update(consumer())
+            candidate_names.update(
+                self._buffers_implied_by_event(event, current_names)
             )
-            key = (agent_name, buffer_name)
-            if not force and self._signatures.get(key) == signature:
+        agent._known_buffer_names = current_names
+        if not candidate_names:
+            return changed
+
+        for buffer_name in sorted(candidate_names, key=str.lower):
+            buffer = buffers.get(buffer_name)
+            if buffer is None:
+                continue
+            snapshot = self.serialize_buffer(buffer)
+            previous = self._latest.get(agent_name, {}).get(buffer_name)
+            if not force and previous == snapshot:
                 continue
 
-            previous = self._latest.get(agent_name, {}).get(buffer_name)
             change_kind = self._change_kind(previous, snapshot)
             self._sequence += 1
             entry = {
@@ -79,10 +93,32 @@ class BufferHistoryRecorder:
                 "snapshot": snapshot,
             }
             self._history[agent_name][buffer_name].append(entry)
-            self._latest[agent_name][buffer_name] = deepcopy(snapshot)
-            self._signatures[key] = signature
+            # Snapshots are newly built JSON-safe structures and are never
+            # mutated internally, so a second deep copy is unnecessary here.
+            self._latest[agent_name][buffer_name] = snapshot
             changed.append(entry)
         return changed
+
+    @staticmethod
+    def _buffers_implied_by_event(
+        event: Any | None, available: set[str]
+    ) -> set[str]:
+        if event is None:
+            return set()
+        module = getattr(event, "module", None)
+        if module is None:
+            try:
+                module = event[1]
+            except Exception:
+                module = None
+        if module is None:
+            return set()
+        normalized = str(module).strip()
+        direct = next(
+            (name for name in available if name.casefold() == normalized.casefold()),
+            None,
+        )
+        return {direct} if direct is not None else set()
 
     def agent_names(self) -> list[str]:
         return sorted(self._history)

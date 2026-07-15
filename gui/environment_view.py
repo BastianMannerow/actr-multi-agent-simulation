@@ -76,12 +76,18 @@ class EnvironmentView(QFrame):
     def refresh(self) -> None:
         matrix = getattr(self.environment, "level_matrix", None)
         if matrix and matrix[0]:
-            agent_count = sum(
-                1
-                for row in matrix
-                for cell in row
-                for obj in cell
-                if getattr(obj, "name", None)
+            agent_count = int(
+                getattr(
+                    self.environment,
+                    "agent_count",
+                    sum(
+                        1
+                        for row in matrix
+                        for cell in row
+                        for obj in cell
+                        if getattr(obj, "name", None)
+                    ),
+                )
             )
             backend = str(getattr(self.environment, "backend_name", "virtual")).upper()
             level_name = str(getattr(self.environment, "level_name", "")).strip()
@@ -93,4 +99,4 @@ class EnvironmentView(QFrame):
             )
         else:
             self.info_label.setText("Not initialized")
-        self.canvas.update()
+        self.canvas.refresh_from_environment()

@@ -55,7 +55,7 @@ class Middleman:
             return [set()], [{}]
 
         row, column = position
-        agent_map = agent.get_agent_dictionary()
+        agent_symbols = getattr(agent, "_agent_symbol_by_identity", {})
         los = agent.los
         rows, columns = len(matrix), len(matrix[0])
         if los == 0 or los >= rows or los >= columns:
@@ -88,7 +88,7 @@ class Middleman:
 
                 symbols: list[str] = []
                 for object_index, element in enumerate(cell):
-                    symbol = self._symbol_for(element, agent_map)
+                    symbol = self._symbol_for(element, agent_symbols)
                     if symbol is None:
                         continue
 
@@ -134,12 +134,11 @@ class Middleman:
         return [trigger_symbols], [frame]
 
     @staticmethod
-    def _symbol_for(element: Any, agent_map: dict[str, Any]) -> str | None:
+    def _symbol_for(element: Any, agent_symbols: dict[int, str]) -> str | None:
         if isinstance(element, SpatialAgent):
-            for candidate, info in agent_map.items():
-                if info["agent"] is element:
-                    return str(candidate)
-            return str(getattr(element, "symbol", "A"))
+            return str(
+                agent_symbols.get(id(element), getattr(element, "symbol", "A"))
+            )
         if isinstance(element, SpatialEntity):
             return str(getattr(element, "symbol", "?"))
         if getattr(element, "symbol", None):

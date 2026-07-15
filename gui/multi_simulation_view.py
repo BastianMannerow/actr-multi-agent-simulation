@@ -121,8 +121,19 @@ class SimulationSettingsDialog(QDialog):
         self.middleman_check.setChecked(self._source.print_middleman)
         self.agent_actions_check = QCheckBox("Print agent actions by default")
         self.agent_actions_check.setChecked(self._source.print_agent_actions)
+        self.experimental_pyactr_boost_check = QCheckBox(
+            "Experimental pyactr performance boost"
+        )
+        self.experimental_pyactr_boost_check.setChecked(
+            self._source.experimental_pyactr_performance_boost
+        )
+        self.experimental_pyactr_boost_check.setToolTip(
+            "Applies the reversible pyactr_overrides package inside each "
+            "worker process. Disable it to use unmodified pyactr 0.3.2."
+        )
         logging_layout.addWidget(self.middleman_check)
         logging_layout.addWidget(self.agent_actions_check)
+        logging_layout.addWidget(self.experimental_pyactr_boost_check)
         content_layout.addWidget(logging_group)
 
         agents_group = QGroupBox("Agents", content)
@@ -172,6 +183,9 @@ class SimulationSettingsDialog(QDialog):
             print_middleman=self.middleman_check.isChecked(),
             speed_factor=self._source.speed_factor,
             print_agent_actions=self.agent_actions_check.isChecked(),
+            experimental_pyactr_performance_boost=(
+                self.experimental_pyactr_boost_check.isChecked()
+            ),
             los=self.los_spin.value(),
             execution_mode="single",
             environment_mode=str(self.environment_mode_combo.currentData()),

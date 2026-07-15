@@ -67,6 +67,11 @@ class AgentConstruct(SpatialAgent):
         self.visual_frame_valid_positions = set()  # In-bounds cells in the current frame.
         self.triggers = [set()]              # One trigger collection per visual frame.
         self.stimuli = [{}]                  # One pyactr-safe visual frame.
+        self.perception_dirty = True         # Rebuild perception only after world changes.
+        self._perception_revision = -1
+        self._dirty_buffers: set[str] = set()
+        self._known_buffer_names: set[str] = set()
+        self._agent_symbol_by_identity: dict[int, str] = {}
 
     # ---------------------------
     # Initialization utilities
@@ -123,6 +128,7 @@ class AgentConstruct(SpatialAgent):
             )
         simulation_kwargs["initial_time"] = float(self.actr_time)
         self.simulation = self.actr_agent.simulation(**simulation_kwargs)
+        self.mark_buffer_dirty(*getattr(self.actr_agent, "goals", {}).keys())
 
     # ---------------------------
     # Social identification
@@ -148,6 +154,10 @@ class AgentConstruct(SpatialAgent):
             generate_letter_code(i): {"agent": agent}
             for i, agent in enumerate(agent_list)
         }
+        self._agent_symbol_by_identity = {
+            id(info["agent"]): symbol
+            for symbol, info in self.agent_dictionary.items()
+        }
 
     def get_agent_dictionary(self):
         """Return the dictionary of letter-coded agent references."""
@@ -156,22 +166,41 @@ class AgentConstruct(SpatialAgent):
     # ---------------------------
     # Perception pipeline
     # ---------------------------
-    def update_stimulus(self, *, publish: bool = True):
-        """Refresh the live pyactr visual frame for this agent.
+    def mark_perception_dirty(self) -> None:
+        """Invalidate the cached visual frame after a relevant world change."""
+        self.perception_dirty = True
 
-        The Middleman returns only pyactr-supported stimulus fields. Rich world
-        metadata remains available separately in ``visual_metadata``. When a
-        running cognitive simulation exists, the updated frame is published to
-        pyactr immediately and automatic visual buffers are refreshed with
-        pyactr's own chunk constructors.
+    def mark_buffer_dirty(self, *buffer_names: str) -> None:
+        """Record buffers changed outside pyactr's visible event stream."""
+        self._dirty_buffers.update(str(name) for name in buffer_names if name)
+
+    def consume_dirty_buffers(self) -> set[str]:
+        dirty = set(self._dirty_buffers)
+        self._dirty_buffers.clear()
+        return dirty
+
+    def update_stimulus(self, *, publish: bool = True, force: bool = False) -> bool:
+        """Refresh perception only when the world invalidated this agent's frame.
+
+        For visual ACT-R models the cached frame is still republished before a
+        step because all agents share one pyactr Environment. Non-visual models
+        avoid both frame construction and publication while nothing changed.
         """
-        if not self.middleman.experiment_environment:
-            return
-        new_triggers, new_stimuli = self.middleman.get_agent_stimulus(self)
-        self.triggers = new_triggers
-        self.stimuli = new_stimuli
+        environment = self.middleman.experiment_environment
+        if environment is None:
+            return False
+        rebuilt = bool(force or self.perception_dirty)
+        if rebuilt:
+            new_triggers, new_stimuli = self.middleman.get_agent_stimulus(self)
+            self.triggers = new_triggers
+            self.stimuli = new_stimuli
+            self.perception_dirty = False
+            self._perception_revision = int(
+                getattr(environment, "world_revision", self._perception_revision + 1)
+            )
         if publish and self.uses_visual_module:
             pyactr_extension.publish_visual_stimulus(self)
+        return rebuilt
 
     # ---------------------------
     # ACT-R extensions and reset
@@ -222,6 +251,7 @@ class AgentConstruct(SpatialAgent):
         # backwards and corrupt multi-agent ordering and history exports.
         simulation_kwargs["initial_time"] = float(self.actr_time)
         self.simulation = self.actr_agent.simulation(**simulation_kwargs)
+        self.mark_buffer_dirty(*getattr(self.actr_agent, "goals", {}).keys())
         self.no_increase_count = 0
 
     def handle_empty_schedule(self):
